@@ -25,7 +25,7 @@ import java.util.concurrent.*;
 /**
  * SoulWayBot + Prodamus:
  *  - «О клубе» → текст + кнопки «Тарифы», «Назад».
- *  - «Тарифы» → три кнопки-ссылки Prodamus с order_id и days.
+ *  - «Тарифы» → три кнопки-ссылки Prodamus с order_id и days (+ тестовый тариф).
  *  - Webhook Prodamus: активация подписки и приглашение в группу.
  *  - Периодическая чистка истекших подписок.
  */
@@ -59,14 +59,19 @@ public class SoulWayBot extends TelegramLongPollingBot {
     private static final String S_TAR3_DAYS  = "tariff3_days";
     private static final String S_TAR3_URL   = "tariff3_url";
 
-    private static final String S_GROUP_ID        = "group_id";          // -100...
-    private static final String S_GROUP_INVITE_URL= "group_invite_url";  // постоянная ссылка (если задана)
+    // Тестовый тариф (включается, если задан URL)
+    private static final String S_TARX_LABEL = "tariffx_label";
+    private static final String S_TARX_DAYS  = "tariffx_days";
+    private static final String S_TARX_URL   = "tariffx_url";
 
-    // Бот / Админ / Канал
-    private final String BOT_TOKEN = System.getenv().getOrDefault("TG_BOT_TOKEN", "7597890353:AAE8SOaw1tmRBeYkivFCeHoQ1vwI_IWtzMM");
+    private static final String S_GROUP_ID         = "group_id";          // -100...
+    private static final String S_GROUP_INVITE_URL = "group_invite_url";  // постоянная ссылка (если задана)
+
+    // Бот / Админ / Канал (лучше хранить только в ENV; дефолты оставлены как было у тебя)
+    private final String BOT_TOKEN    = System.getenv().getOrDefault("TG_BOT_TOKEN", "7597890353:AAE8SOaw1tmRBeYkivFCeHoQ1vwI_IWtzMM");
     private final String BOT_USERNAME = System.getenv().getOrDefault("TG_BOT_USERNAME", "SoulWayClub_bot");
-    private final long ADMIN_ID = Long.parseLong(System.getenv().getOrDefault("TG_ADMIN_ID", "726773708"));
-    private final String CHANNEL_ID = System.getenv().getOrDefault("TG_CHANNEL_ID", "sibirskaiapro"); // без @
+    private final long   ADMIN_ID     = Long.parseLong(System.getenv().getOrDefault("TG_ADMIN_ID", "726773708"));
+    private final String CHANNEL_ID   = System.getenv().getOrDefault("TG_CHANNEL_ID", "sibirskaiapro"); // без @
 
     private final SQLiteManager db;
     private final SimpleDateFormat df = new SimpleDateFormat("dd.MM.yyyy HH:mm");
@@ -138,6 +143,11 @@ public class SoulWayBot extends TelegramLongPollingBot {
         putIfEmpty(S_TAR3_LABEL, "12 МЕС • 12900 ₽");
         putIfEmpty(S_TAR3_DAYS,  "365");
         putIfEmpty(S_TAR3_URL,   "https://payform.ru/kr9it4z/");
+
+        // Тестовый тариф (можно скрыть, передав пустой URL через /settarifftest)
+        putIfEmpty(S_TARX_LABEL, "ТЕСТ • 10 ₽");
+        putIfEmpty(S_TARX_DAYS,  "1");
+        putIfEmpty(S_TARX_URL,   "https://payform.ru/699mto3/");
     }
 
     private void putIfEmpty(String key, String value) {
@@ -170,8 +180,11 @@ public class SoulWayBot extends TelegramLongPollingBot {
 
         try {
             if (text.startsWith("/")) {
-                handleCommand(msg, text);
-                return;
+                // Пытаемся обработать как команду
+                boolean handled = handleCommand(msg, text);
+                if (handled) return;
+                // Если команда неизвестна — считаем, что это кодовое слово со слэшем
+                text = text.substring(1).trim();
             }
 
             if (!text.isEmpty()) {
@@ -191,7 +204,8 @@ public class SoulWayBot extends TelegramLongPollingBot {
         }
     }
 
-    private void handleCommand(Message msg, String text) {
+    /** @return true если команда обработана; false — если неизвестная (пусть станет ключевым словом) */
+    private boolean handleCommand(Message msg, String text) {
         long chatId = msg.getChatId();
         long userId = msg.getFrom().getId();
         String[] parts = text.split(" ", 2);
@@ -202,28 +216,38 @@ public class SoulWayBot extends TelegramLongPollingBot {
             switch (cmd) {
                 case "/start": {
                     sendText(chatId, "👋 Привет! Это @" + BOT_USERNAME + ".\nВведи кодовое слово из Instagram и получи подарок 🎁");
-                    break;
+                    return true;
                 }
                 case "/addkw": {
-                    if (!isAdmin(userId)) { sendText(chatId, "Доступно только администратору."); return; }
-                    if (args.isBlank()) { sendText(chatId, "Формат: /addkw KEY|INTRO|REWARD|mat1,mat2"); return; }
+                    if (!isAdmin(userId)) { sendText(chatId, "Доступно только администратору."); return true; }
+                    if (args.isBlank()) { sendText(chatId, "Формат: /addkw KEY|INTRO|REWARD|materials(через запятую)"); return true; }
+
+                    // Делим на 4 логических поля по первым 3 символам '|'
                     String[] p = args.split("\\|", 4);
-                    if (p.length < 3) { sendText(chatId, "Нужно минимум KEY|INTRO|REWARD"); return; }
-                    Keyword kw = new Keyword();
-                    kw.setKeyword(safeTrim(p[0]));
-                    kw.setIntroText(safeTrim(p[1]));
-                    kw.setRewardText(safeTrim(p[2]));
-                    if (p.length == 4 && p[3] != null && !p[3].isBlank()) {
-                        List<String> mats = new ArrayList<>();
-                        for (String s : p[3].split(",")) { String v = safeTrim(s); if (!v.isEmpty()) mats.add(v); }
-                        kw.setMaterials(mats);
-                    } else kw.setMaterials(Collections.emptyList());
+                    if (p.length < 3) { sendText(chatId, "Нужно минимум: KEY|INTRO|REWARD"); return true; }
+
+                    String key    = safeTrim(p[0]);
+                    String intro  = safeTrim(p[1]);
+                    String reward = safeTrim(p[2]);
+                    String matsRaw= (p.length == 4) ? safeTrim(p[3]) : "";
+
+                    List<String> mats = new ArrayList<>();
+                    if (!matsRaw.isEmpty()) {
+                        // Материалы разделяем ТОЛЬКО по запятой; пробелы/скобки в пути сохраняем
+                        for (String s : matsRaw.split(",")) {
+                            String v = safeTrim(s);
+                            if (!v.isEmpty()) mats.add(v);
+                        }
+                    }
+
+                    Keyword kw = new Keyword(key, intro, reward, mats);
                     db.upsertKeyword(kw);
-                    sendText(chatId, "✅ Добавлено/обновлено: " + kw.getKeyword());
-                    break;
+                    sendText(chatId, "✅ Добавлено/обновлено ключевое слово: " + kw.getKeyword()
+                            + (mats.isEmpty() ? "" : "\nМатериалы: " + String.join(", ", mats)));
+                    return true;
                 }
                 case "/listkw": {
-                    if (!isAdmin(userId)) { sendText(chatId, "Доступ только администратору."); return; }
+                    if (!isAdmin(userId)) { sendText(chatId, "Доступ только администратору."); return true; }
                     List<Keyword> list = db.listKeywords();
                     if (list.isEmpty()) sendText(chatId, "Список пуст.");
                     else {
@@ -231,80 +255,96 @@ public class SoulWayBot extends TelegramLongPollingBot {
                         for (Keyword k : list) sb.append("• ").append(k.getKeyword()).append("\n");
                         sendText(chatId, sb.toString());
                     }
-                    break;
+                    return true;
                 }
 
                 // ===== редактируемые тексты/ссылки =====
-                case "/setwelcome":       if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_WELCOME_TEXT, args); sendText(chatId, "✅ Приветственный текст обновлён."); break;
-                case "/setwelcomevideo":  if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_WELCOME_VIDEO, args); sendText(chatId, "✅ Видео для приветствия обновлено."); break;
-                case "/setclub":          if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_CLUB_TEXT, args);     sendText(chatId, "✅ Текст «О клубе» обновлён."); break;
-                case "/setreviews":       if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_REVIEWS_URL, args);   sendText(chatId, "✅ Ссылка «Отзывы» обновлена."); break;
-                case "/setreviews_text":  if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_REVIEWS_TEXT, args);  sendText(chatId, "✅ Текст «Отзывы» обновлён."); break;
-                case "/setabout":         if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_ABOUT_TEXT, args);    sendText(chatId, "✅ Текст «Обо мне» обновлён."); break;
-                case "/setsessions":      if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_SESSIONS_URL, args);  sendText(chatId, "✅ Ссылка «Мои сеансы» обновлена."); break;
-                case "/setsessions_text": if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_SESSIONS_TEXT, args); sendText(chatId, "✅ Текст «Мои сеансы» обновлён."); break;
-                case "/setprocveta":      if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_PROCVETA_URL, args);  sendText(chatId, "✅ Ссылка «Клуб Процветай» обновлена."); break;
-                case "/setprocveta_text": if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_PROCVETA_TEXT, args); sendText(chatId, "✅ Текст «Клуб Процветай» обновлён."); break;
+                case "/setwelcome":       if (!isAdmin(userId)) { deny(chatId); return true; } db.setSetting(S_WELCOME_TEXT, args); sendText(chatId, "✅ Приветственный текст обновлён."); return true;
+                case "/setwelcomevideo":  if (!isAdmin(userId)) { deny(chatId); return true; } db.setSetting(S_WELCOME_VIDEO, args); sendText(chatId, "✅ Видео для приветствия обновлено."); return true;
+                case "/setclub":          if (!isAdmin(userId)) { deny(chatId); return true; } db.setSetting(S_CLUB_TEXT, args);     sendText(chatId, "✅ Текст «О клубе» обновлён."); return true;
+                case "/setreviews":       if (!isAdmin(userId)) { deny(chatId); return true; } db.setSetting(S_REVIEWS_URL, args);   sendText(chatId, "✅ Ссылка «Отзывы» обновлена."); return true;
+                case "/setreviews_text":  if (!isAdmin(userId)) { deny(chatId); return true; } db.setSetting(S_REVIEWS_TEXT, args);  sendText(chatId, "✅ Текст «Отзывы» обновлён."); return true;
+                case "/setabout":         if (!isAdmin(userId)) { deny(chatId); return true; } db.setSetting(S_ABOUT_TEXT, args);    sendText(chatId, "✅ Текст «Обо мне» обновлён."); return true;
+                case "/setsessions":      if (!isAdmin(userId)) { deny(chatId); return true; } db.setSetting(S_SESSIONS_URL, args);  sendText(chatId, "✅ Ссылка «Мои сеансы» обновлена."); return true;
+                case "/setsessions_text": if (!isAdmin(userId)) { deny(chatId); return true; } db.setSetting(S_SESSIONS_TEXT, args); sendText(chatId, "✅ Текст «Мои сеансы» обновлён."); return true;
+                case "/setprocveta":      if (!isAdmin(userId)) { deny(chatId); return true; } db.setSetting(S_PROCVETA_URL, args);  sendText(chatId, "✅ Ссылка «Клуб Процветай» обновлена."); return true;
+                case "/setprocveta_text": if (!isAdmin(userId)) { deny(chatId); return true; } db.setSetting(S_PROCVETA_TEXT, args); sendText(chatId, "✅ Текст «Клуб Процветай» обновлён."); return true;
 
                 // ===== Тарифы (лейбл/дни/URL) =====
-                case "/settariff1": { // LABEL|DAYS|URL
-                    if (!isAdmin(userId)) { deny(chatId); break; }
+                case "/settariff1": {
+                    if (!isAdmin(userId)) { deny(chatId); return true; }
                     String[] a = args.split("\\|", 3);
-                    if (a.length < 3) { sendText(chatId, "Формат: /settariff1 LABEL|DAYS|URL"); break; }
+                    if (a.length < 3) { sendText(chatId, "Формат: /settariff1 LABEL|DAYS|URL"); return true; }
                     db.setSetting(S_TAR1_LABEL, a[0].trim());
                     db.setSetting(S_TAR1_DAYS,  a[1].trim());
                     db.setSetting(S_TAR1_URL,   a[2].trim());
                     sendText(chatId, "✅ Тариф #1 сохранён.");
-                    break;
+                    return true;
                 }
                 case "/settariff2": {
-                    if (!isAdmin(userId)) { deny(chatId); break; }
+                    if (!isAdmin(userId)) { deny(chatId); return true; }
                     String[] a = args.split("\\|", 3);
-                    if (a.length < 3) { sendText(chatId, "Формат: /settariff2 LABEL|DAYS|URL"); break; }
+                    if (a.length < 3) { sendText(chatId, "Формат: /settariff2 LABEL|DAYS|URL"); return true; }
                     db.setSetting(S_TAR2_LABEL, a[0].trim());
                     db.setSetting(S_TAR2_DAYS,  a[1].trim());
                     db.setSetting(S_TAR2_URL,   a[2].trim());
                     sendText(chatId, "✅ Тариф #2 сохранён.");
-                    break;
+                    return true;
                 }
                 case "/settariff3": {
-                    if (!isAdmin(userId)) { deny(chatId); break; }
+                    if (!isAdmin(userId)) { deny(chatId); return true; }
                     String[] a = args.split("\\|", 3);
-                    if (a.length < 3) { sendText(chatId, "Формат: /settariff3 LABEL|DAYS|URL"); break; }
+                    if (a.length < 3) { sendText(chatId, "Формат: /settariff3 LABEL|DAYS|URL"); return true; }
                     db.setSetting(S_TAR3_LABEL, a[0].trim());
                     db.setSetting(S_TAR3_DAYS,  a[1].trim());
                     db.setSetting(S_TAR3_URL,   a[2].trim());
                     sendText(chatId, "✅ Тариф #3 сохранён.");
-                    break;
+                    return true;
+                }
+                // ===== Тестовый тариф =====
+                case "/settarifftest": {
+                    if (!isAdmin(userId)) { deny(chatId); return true; }
+                    String[] a = args.split("\\|", 3);
+                    if (a.length < 3) {
+                        sendText(chatId, "Формат: /settarifftest LABEL|DAYS|URL\nЧтобы скрыть тариф — передай пустой URL (третий параметр).");
+                        return true;
+                    }
+                    db.setSetting(S_TARX_LABEL, a[0].trim());
+                    db.setSetting(S_TARX_DAYS,  a[1].trim());
+                    db.setSetting(S_TARX_URL,   a[2].trim()); // пустой → кнопка пропадёт
+                    sendText(chatId, "✅ Тестовый тариф сохранён.");
+                    return true;
                 }
 
                 // ===== Группа / Сервисные =====
-                case "/setgroup":     if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_GROUP_ID, args.trim());         sendText(chatId, "✅ ID группы сохранён."); break;
-                case "/setgrouplink": if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_GROUP_INVITE_URL, args.trim()); sendText(chatId, "✅ Инвайт-ссылка группы сохранена."); break;
+                case "/setgroup":     if (!isAdmin(userId)) { deny(chatId); return true; } db.setSetting(S_GROUP_ID, args.trim());         sendText(chatId, "✅ ID группы сохранён."); return true;
+                case "/setgrouplink": if (!isAdmin(userId)) { deny(chatId); return true; } db.setSetting(S_GROUP_INVITE_URL, args.trim()); sendText(chatId, "✅ Инвайт-ссылка группы сохранена."); return true;
                 case "/grantsub": {
-                    if (!isAdmin(userId)) { deny(chatId); break; }
+                    if (!isAdmin(userId)) { deny(chatId); return true; }
                     String[] a = args.split("\\s+");
-                    if (a.length < 2) { sendText(chatId, "Формат: /grantsub <userId> <days>"); break; }
+                    if (a.length < 2) { sendText(chatId, "Формат: /grantsub <userId> <days>"); return true; }
                     long uid = Long.parseLong(a[0]);
                     int days = Integer.parseInt(a[1]);
                     db.grantSubscription(uid, days);
                     sendText(chatId, "✅ Выдана подписка: user " + uid + " на " + days + " дн.");
                     String invite = ensureInviteLink();
                     if (invite != null) sendText(uid, "🔗 Ссылка для входа в чат: " + invite);
-                    break;
+                    return true;
                 }
                 case "/cleanup": {
-                    if (!isAdmin(userId)) { deny(chatId); break; }
+                    if (!isAdmin(userId)) { deny(chatId); return true; }
                     int n = cleanupExpired();
                     sendText(chatId, "🧹 Удалено из группы: " + n);
-                    break;
+                    return true;
                 }
 
                 default:
-                    sendText(chatId, "Неизвестная команда.");
+                    // неизвестная команда — пусть обработается как кодовое слово
+                    return false;
             }
         } catch (Exception e) {
             LOG.error("handleCommand error", e);
+            return true; // считаем обработанной, чтобы не дублировать ошибки в чат
         }
     }
 
@@ -335,7 +375,9 @@ public class SoulWayBot extends TelegramLongPollingBot {
                 Keyword kw = db.findKeywordByKey(key);
                 if (kw == null) { answerCallback(cb.getId(), "Кодовое слово не найдено."); return; }
                 answerCallback(cb.getId(), "✅ Подписка подтверждена!");
+                // 1) Выдаём бонус (без авто-приветствия внутри)
                 sendReward(chatId, kw);
+                // 2) ОДИН раз шлём приветствие с меню
                 String firstName = cb.getFrom().getFirstName() != null ? cb.getFrom().getFirstName() : "друг";
                 sendWelcomeWithMenu(chatId, firstName);
                 return;
@@ -496,6 +538,7 @@ public class SoulWayBot extends TelegramLongPollingBot {
     }
 
     private void sendTariffs(long chatId, long userId, boolean withBack) {
+        // Основные тарифы
         String l1 = db.getSetting(S_TAR1_LABEL, "1 МЕС • 1299 ₽");
         int d1 = safeParseInt(db.getSetting(S_TAR1_DAYS, "30"), 30);
         String u1 = db.getSetting(S_TAR1_URL,  "https://payform.ru/4e9isVQ/");
@@ -508,10 +551,25 @@ public class SoulWayBot extends TelegramLongPollingBot {
         int d3 = safeParseInt(db.getSetting(S_TAR3_DAYS, "365"), 365);
         String u3 = db.getSetting(S_TAR3_URL,  "https://payform.ru/kr9it4z/");
 
-        // к ссылкам добавляем order_id и days — Prodamus пришлёт их в webhook
+        // Тестовый тариф
+        String lx = db.getSetting(S_TARX_LABEL, "ТЕСТ • 10 ₽");
+        int dx     = safeParseInt(db.getSetting(S_TARX_DAYS, "1"), 1);
+        String ux  = db.getSetting(S_TARX_URL,  "");
+
+        // подставляем order_id и days
         String link1 = appendParams(u1, Map.of("order_id", String.valueOf(userId), "days", String.valueOf(d1)));
         String link2 = appendParams(u2, Map.of("order_id", String.valueOf(userId), "days", String.valueOf(d2)));
         String link3 = appendParams(u3, Map.of("order_id", String.valueOf(userId), "days", String.valueOf(d3)));
+
+        List<List<InlineKeyboardButton>> rows = new ArrayList<>();
+
+        // Тестовый тариф — если включён (URL задан), показываем ПЕРВЫМ
+        if (ux != null && !ux.isBlank()) {
+            String linkX = appendParams(ux, Map.of("order_id", String.valueOf(userId), "days", String.valueOf(dx)));
+            InlineKeyboardButton bx = new InlineKeyboardButton(lx + " • оплатить");
+            bx.setUrl(linkX);
+            rows.add(List.of(bx));
+        }
 
         InlineKeyboardButton b1 = new InlineKeyboardButton(l1 + " • оплатить");
         b1.setUrl(link1);
@@ -520,7 +578,6 @@ public class SoulWayBot extends TelegramLongPollingBot {
         InlineKeyboardButton b3 = new InlineKeyboardButton(l3 + " • оплатить");
         b3.setUrl(link3);
 
-        List<List<InlineKeyboardButton>> rows = new ArrayList<>();
         rows.add(List.of(b1));
         rows.add(List.of(b2));
         rows.add(List.of(b3));
@@ -619,13 +676,13 @@ public class SoulWayBot extends TelegramLongPollingBot {
 
     // ===================== Награда (фото/документы) =====================
 
+    /** ВНИМАНИЕ: здесь НЕТ вызова sendWelcomeWithMenu — приветствие шлётся снаружи один раз. */
     private void sendReward(long chatId, Keyword kw) {
         try {
             List<String> materials = kw.getMaterials();
             String rewardText = safeTrim(kw.getRewardText());
             if (materials == null || materials.isEmpty()) {
                 if (!rewardText.isEmpty()) sendText(chatId, rewardText);
-                sendWelcomeWithMenu(chatId, "друг");
                 return;
             }
             String image = null;
@@ -638,7 +695,6 @@ public class SoulWayBot extends TelegramLongPollingBot {
             }
             if (image != null && docs.isEmpty()) {
                 sendSinglePhoto(chatId, image, rewardText);
-                sendWelcomeWithMenu(chatId, "друг");
                 return;
             }
             if (image != null) {
@@ -650,7 +706,6 @@ public class SoulWayBot extends TelegramLongPollingBot {
                 if (!rewardText.isEmpty()) sendText(chatId, rewardText);
                 sendDocumentsSmart(chatId, docs);
             }
-            sendWelcomeWithMenu(chatId, "друг");
         } catch (Exception e) {
             LOG.error("sendReward error", e);
         }
@@ -771,6 +826,7 @@ public class SoulWayBot extends TelegramLongPollingBot {
         File f = new File(ref);
         if (f.exists() && f.isFile()) return new InputFile(f, f.getName());
         if (ref.startsWith("http://") || ref.startsWith("https://")) return new InputFile(normalizeUrl(ref));
+        LOG.warn("toInputFile: локальный файл не найден и это не URL, используем как file_id: {}", ref);
         return new InputFile(ref); // file_id
     }
 
