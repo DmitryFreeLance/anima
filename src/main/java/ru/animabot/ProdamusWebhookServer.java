@@ -6,8 +6,6 @@ import com.sun.net.httpserver.HttpServer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import javax.crypto.Mac;
-import javax.crypto.spec.SecretKeySpec;
 import java.io.*;
 import java.net.InetSocketAddress;
 import java.net.URLDecoder;
@@ -15,12 +13,13 @@ import java.nio.charset.StandardCharsets;
 import java.util.*;
 
 /**
- * Webhook-сервер Prodamus:
- *  - POST /webhook/prodamus
- *  - Поддерживает application/x-www-form-urlencoded и application/json
- *  - Подпись HMAC-SHA256: ищем в заголовках и в теле (signature/sign), сравниваем как HEX, base64, и sha256=HEX
- *  - UID берём из кастомных полей: customer_extra / tg_id (НЕ из order_id)
- *  - Период подписки: tar_days (fallback: days/period/period_days)
+ * Простой HTTP-сервер для приёма webhook от Prodamus:
+ *  - endpoint: POST /webhook/prodamus
+ *  - формат: application/x-www-form-urlencoded
+ *  - подпись: HMAC-SHA256 (секрет из PRODAMUS_SECRET) по сырому телу
+ *
+ * Мы кладём в ссылку параметр customer_extra=<Telegram userId> и days=<число дней>.
+ * Prodamus возвращает customer_extra как есть, поэтому по нему находим пользователя.
  */
 public class ProdamusWebhookServer {
 
@@ -32,7 +31,7 @@ public class ProdamusWebhookServer {
 
     public ProdamusWebhookServer(SoulWayBot bot, int port, String secret) throws IOException {
         this.bot = bot;
-        this.secret = secret == null ? "" : secret.trim();
+        this.secret = (secret == null) ? "" : secret.trim();
         server = HttpServer.create(new InetSocketAddress(port), 0);
         server.createContext("/webhook/prodamus", new Handler());
         server.setExecutor(java.util.concurrent.Executors.newCachedThreadPool());
@@ -48,39 +47,24 @@ public class ProdamusWebhookServer {
             long t0 = System.currentTimeMillis();
             try {
                 if (!"POST".equalsIgnoreCase(ex.getRequestMethod())) {
-                    respond(ex, 405, "method not allowed"); return;
+                    respond(ex, 405, "method not allowed");
+                    return;
                 }
 
                 byte[] raw = readAll(ex.getRequestBody());
-                String ctype = firstHeader(ex, "Content-Type");
-                String body = new String(raw, StandardCharsets.UTF_8);
-
-                // подпись из заголовков
-                String gotSig = firstNonEmpty(
-                        firstHeader(ex, "Signature"),
-                        firstHeader(ex, "X-Signature"),
-                        firstHeader(ex, "X-Webhook-Signature"),
-                        firstHeader(ex, "X-Auth-Signature"),
-                        null
-                );
+                String ctype = Optional.ofNullable(ex.getRequestHeaders().getFirst("Content-Type")).orElse("");
+                String sigHeader = firstNonEmpty(
+                        ex.getRequestHeaders().getFirst("Signature"),
+                        ex.getRequestHeaders().getFirst("X-Signature"),
+                        ex.getRequestHeaders().getFirst("X-Webhook-Signature"),
+                        null);
 
                 LOG.info("[prodamus] incoming: ct='{}', sigHeader='{}', rawLen={} bytes",
-                        ctype, gotSig != null ? "present" : "absent", raw.length);
-                if (LOG.isDebugEnabled()) {
-                    LOG.debug("[prodamus] headers: {}", headersToMap(ex));
-                    LOG.debug("[prodamus] body: {}", body);
-                }
+                        shortCt(ctype), sigHeader == null ? "absent" : "present", raw.length);
 
-                // парсим тело в map
-                Map<String, Object> any = parseBodyToMap(ctype, body);
-                Map<String, String> flat = flattenMap(any);
-
-                // если подписи нет в заголовке — возьмём из тела
-                if (gotSig == null) gotSig = firstNonEmpty(flat.get("signature"), flat.get("sign"));
-
-                // проверка подписи (если секрет задан)
+                // Проверка подписи (если секрет задан)
                 if (!secret.isBlank()) {
-                    if (!verifySignatureFlexible(raw, gotSig, secret)) {
+                    if (!verifySignatureFlexible(raw, sigHeader, secret)) {
                         LOG.warn("[prodamus] bad signature -> reject");
                         respond(ex, 400, "bad signature");
                         return;
@@ -89,36 +73,29 @@ public class ProdamusWebhookServer {
                     LOG.warn("[prodamus] PRODAMUS_SECRET is empty — signature check is DISABLED!");
                 }
 
-                if (LOG.isDebugEnabled()) {
-                    LOG.debug("[prodamus] flat map: {}", flat);
-                }
+                String body = new String(raw, StandardCharsets.UTF_8);
+                Map<String, Object> form = parseForm(body);
 
-                // ВНИМАНИЕ: uid берём ТОЛЬКО из наших полей (НЕ order_id Prodamus)
-                long uid = tryParseLongAny(flat,
-                        "customer_extra", "customerExtra",
-                        "tg_id", "meta.tg_id",
-                        "order.customer_extra", "invoice.customer_extra"
-                );
-
-                long daysL = tryParseLongAny(flat,
-                        "tar_days", "meta.tar_days",
-                        "days", "period", "period_days",
-                        "order.days", "invoice.days"
-                );
-                int days = (daysL > 0 && daysL <= Integer.MAX_VALUE) ? (int) daysL : 30;
+                // читаем uid из customer_extra (как мы передали в платёжной ссылке)
+                long uid = parseLong(getString(form, "customer_extra"), -1);
+                int days = (int) parseLong(getString(form, "days"), 30);
 
                 LOG.info("[prodamus] parsed: uid={}, days={}", uid, days);
 
                 if (uid > 0) {
-                    bot.onProdamusPaid(uid, days);
-                    respond(ex, 200, "ok");
+                    try {
+                        bot.onProdamusPaid(uid, days);
+                        respond(ex, 200, "ok");
+                    } catch (Exception e) {
+                        LOG.error("onProdamusPaid failed", e);
+                        respond(ex, 500, "internal error");
+                    }
                 } else {
-                    LOG.warn("[prodamus] webhook without uid; flat={}", flat);
-                    respond(ex, 200, "ok (no uid)");
+                    LOG.warn("[prodamus] webhook without uid; flat={}", toFlat(form));
+                    respond(ex, 200, "ok (ignored)");
                 }
-
             } catch (Exception e) {
-                LOG.error("[prodamus] webhook error", e);
+                LOG.error("webhook error", e);
                 respond(ex, 500, "internal error");
             } finally {
                 LOG.info("[prodamus] handled in {} ms", (System.currentTimeMillis() - t0));
@@ -126,28 +103,37 @@ public class ProdamusWebhookServer {
         }
     }
 
-    // ===== подпись =====
+    // ===== helpers =====
 
     private static boolean verifySignatureFlexible(byte[] rawBody, String signature, String secret) {
-        if (signature == null) return false;
+        if (signature == null || signature.isBlank()) return false;
+        String sig = signature.trim();
+
+        // Поддержим форматы:
+        //  - HEX
+        //  - base64
+        //  - "sha256=..." (GitHub-style)
         try {
-            Mac mac = Mac.getInstance("HmacSHA256");
-            mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
-            byte[] calc = mac.doFinal(rawBody != null ? rawBody : new byte[0]);
-
-            String sig = signature.trim();
+            byte[] calc = hmacSha256(rawBody, secret.getBytes(StandardCharsets.UTF_8));
             String hex = toHex(calc);
-            if (constantTimeEquals(hex, sig)) return true;
-
             String b64 = Base64.getEncoder().encodeToString(calc);
-            if (constantTimeEquals(b64, sig)) return true;
 
-            if (sig.startsWith("sha256=") && constantTimeEquals(hex, sig.substring(7))) return true;
+            String sigStr = sig;
+            if (sigStr.toLowerCase(Locale.ROOT).startsWith("sha256=")) {
+                sigStr = sigStr.substring("sha256=".length()).trim();
+            }
 
-            return false;
+            // сравним с hex и base64
+            return constantTimeEquals(hex, sigStr) || constantTimeEquals(b64, sigStr);
         } catch (Exception e) {
             return false;
         }
+    }
+
+    private static byte[] hmacSha256(byte[] data, byte[] key) throws Exception {
+        javax.crypto.Mac mac = javax.crypto.Mac.getInstance("HmacSHA256");
+        mac.init(new javax.crypto.spec.SecretKeySpec(key, "HmacSHA256"));
+        return mac.doFinal(data != null ? data : new byte[0]);
     }
 
     private static String toHex(byte[] b) {
@@ -155,6 +141,7 @@ public class ProdamusWebhookServer {
         for (byte x : b) sb.append(String.format("%02x", x));
         return sb.toString();
     }
+
     private static boolean constantTimeEquals(String a, String b) {
         if (a == null || b == null) return false;
         if (a.length() != b.length()) return false;
@@ -163,78 +150,41 @@ public class ProdamusWebhookServer {
         return r == 0;
     }
 
-    // ===== utils =====
-
-    private static String firstHeader(HttpExchange ex, String name) {
-        try { return ex.getRequestHeaders().getFirst(name); } catch (Exception ignore) { return null; }
-    }
-    private static Map<String, List<String>> headersToMap(HttpExchange ex) {
-        Map<String, List<String>> out = new LinkedHashMap<>();
-        try { ex.getRequestHeaders().forEach((k,v) -> out.put(k, new ArrayList<>(v))); } catch (Exception ignore) {}
-        return out;
+    private static String firstNonEmpty(String... v) {
+        if (v == null) return null;
+        for (String s : v) if (s != null && !s.isBlank()) return s;
+        return null;
     }
 
-    private static Map<String, Object> parseBodyToMap(String contentType, String body) {
-        if (body == null || body.isBlank()) return new LinkedHashMap<>();
-        String ct = (contentType == null) ? "" : contentType.toLowerCase(Locale.ROOT);
-        if (ct.contains("json") || body.trim().startsWith("{") || body.trim().startsWith("[")) {
-            try { return JsonLike.parse(body); } catch (Exception e) { return parseForm(body); }
+    private static String getString(Map<String, Object> map, String key) {
+        Object v = map.get(key);
+        if (v == null) return null;
+        if (v instanceof String) return (String) v;
+        return String.valueOf(v);
+    }
+
+    private static String shortCt(String ct) {
+        int i = ct.indexOf(';');
+        return i >= 0 ? ct.substring(0, i).trim() : ct.trim();
+    }
+
+    private static Map<String, Object> parseForm(String body) throws UnsupportedEncodingException {
+        Map<String, Object> map = new HashMap<>();
+        if (body == null || body.isBlank()) return map;
+        for (String pair : body.split("&")) {
+            int i = pair.indexOf('=');
+            if (i < 0) continue;
+            String k = URLDecoder.decode(pair.substring(0, i), StandardCharsets.UTF_8);
+            String v = URLDecoder.decode(pair.substring(i + 1), StandardCharsets.UTF_8);
+
+            // Поддержка скобочных имён (products[0][name]) — кладём плоско
+            map.put(k, v);
         }
-        return parseForm(body);
-    }
-
-    private static Map<String,Object> parseForm(String body) {
-        Map<String,Object> map = new LinkedHashMap<>();
-        try {
-            if (body == null || body.isBlank()) return map;
-            for (String pair : body.split("&")) {
-                int i = pair.indexOf('=');
-                if (i < 0) continue;
-                String k = URLDecoder.decode(pair.substring(0, i), StandardCharsets.UTF_8);
-                String v = URLDecoder.decode(pair.substring(i + 1), StandardCharsets.UTF_8);
-                map.put(k, v);
-            }
-        } catch (Exception ignore) {}
         return map;
     }
 
-    private static Map<String,String> flattenMap(Map<String, Object> any) {
-        Map<String,String> out = new LinkedHashMap<>();
-        if (any == null) return out;
-        Deque<String> path = new ArrayDeque<>();
-        flatten(any, path, out);
-        return out;
-    }
-    @SuppressWarnings("unchecked")
-    private static void flatten(Object node, Deque<String> path, Map<String,String> out) {
-        if (node == null) return;
-        if (node instanceof Map<?,?> m) {
-            for (Map.Entry<?,?> e : m.entrySet()) {
-                String key = String.valueOf(e.getKey());
-                path.addLast(key);
-                flatten(e.getValue(), path, out);
-                path.removeLast();
-            }
-        } else if (node instanceof List<?> list) {
-            for (int i=0;i<list.size();i++) {
-                path.addLast(String.valueOf(i));
-                flatten(list.get(i), path, out);
-                path.removeLast();
-            }
-        } else {
-            String k = String.join(".", path);
-            out.put(k, String.valueOf(node));
-        }
-    }
-
-    private static long tryParseLongAny(Map<String,String> map, String... keys) {
-        for (String k : keys) {
-            String v = map.get(k);
-            if (v != null && !v.isBlank()) {
-                try { return Long.parseLong(v.trim()); } catch (Exception ignore) {}
-            }
-        }
-        return -1L;
+    private static long parseLong(String s, long def) {
+        try { return Long.parseLong(s.trim()); } catch (Exception e) { return def; }
     }
 
     private static byte[] readAll(InputStream in) throws IOException {
@@ -249,112 +199,12 @@ public class ProdamusWebhookServer {
         byte[] out = txt.getBytes(StandardCharsets.UTF_8);
         ex.getResponseHeaders().add("Content-Type", "text/plain; charset=utf-8");
         ex.sendResponseHeaders(code, out.length);
-        ex.getResponseBody().write(out);
+        try (OutputStream os = ex.getResponseBody()) { os.write(out); }
         ex.close();
     }
 
-    private static String firstNonEmpty(String... v) {
-        if (v == null) return null;
-        for (String s : v) if (s != null && !s.isBlank()) return s;
-        return null;
-    }
-
-    // --- Мини JSON-парсер (без внешних зависимостей) ---
-    static class JsonLike {
-        @SuppressWarnings("unchecked")
-        static Map<String,Object> parse(String s) throws Exception {
-            return (Map<String,Object>) new Parser(s).parseValue();
-        }
-        private static class Parser {
-            private final String str; private int i = 0;
-            Parser(String s) { this.str = s; }
-            Object parseValue() throws Exception {
-                skipWs(); if (i>=str.length()) return null;
-                char c = str.charAt(i);
-                if (c=='{') return parseObject();
-                if (c=='[') return parseArray();
-                if (c=='"'||c=='\'') return parseString();
-                if (isDigit(c)||c=='-') return parseNumber();
-                if (str.startsWith("true", i))  { i+=4; return Boolean.TRUE; }
-                if (str.startsWith("false", i)) { i+=5; return Boolean.FALSE; }
-                if (str.startsWith("null", i))  { i+=4; return null; }
-                return parseBareWord();
-            }
-            Map<String,Object> parseObject() throws Exception {
-                Map<String,Object> m = new LinkedHashMap<>();
-                expect('{'); skipWs();
-                if (peek()=='}') { i++; return m; }
-                while (true) {
-                    skipWs(); String key = String.valueOf(parseValue());
-                    skipWs(); expect(':');
-                    Object val = parseValue(); m.put(trimQuotes(key), val);
-                    skipWs(); char c = peek();
-                    if (c==',') { i++; continue; }
-                    if (c=='}') { i++; break; }
-                    if (i>=str.length()) break;
-                } return m;
-            }
-            List<Object> parseArray() throws Exception {
-                List<Object> a = new ArrayList<>();
-                expect('['); skipWs();
-                if (peek()==']') { i++; return a; }
-                while (true) {
-                    Object v = parseValue(); a.add(v);
-                    skipWs(); char c = peek();
-                    if (c==',') { i++; continue; }
-                    if (c==']') { i++; break; }
-                    if (i>=str.length()) break;
-                } return a;
-            }
-            String parseString() {
-                char quote = str.charAt(i++); StringBuilder sb = new StringBuilder();
-                while (i<str.length()) {
-                    char c = str.charAt(i++);
-                    if (c==quote) break;
-                    if (c=='\\' && i<str.length()) {
-                        char n = str.charAt(i++);
-                        switch (n) {
-                            case 'n': sb.append('\n'); break;
-                            case 'r': sb.append('\r'); break;
-                            case 't': sb.append('\t'); break;
-                            case '"': sb.append('"'); break;
-                            case '\'': sb.append('\''); break;
-                            case '\\': sb.append('\\'); break;
-                            case 'u':
-                                if (i+3<str.length()) {
-                                    String hex = str.substring(i, i+4);
-                                    try { sb.append((char) Integer.parseInt(hex,16)); } catch (Exception ignore) {}
-                                    i+=4;
-                                } break;
-                            default: sb.append(n);
-                        }
-                    } else sb.append(c);
-                } return sb.toString();
-            }
-            Number parseNumber() {
-                int j=i; while (i<str.length()) {
-                    char c=str.charAt(i);
-                    if (isDigit(c)||c=='-'||c=='+'||c=='.'||c=='e'||c=='E') i++; else break;
-                }
-                String sub=str.substring(j,i);
-                try {
-                    if (sub.contains(".")||sub.contains("e")||sub.contains("E")) return Double.parseDouble(sub);
-                    long l=Long.parseLong(sub);
-                    if (l<=Integer.MAX_VALUE && l>=Integer.MIN_VALUE) return (int) l;
-                    return l;
-                } catch (Exception e) { return 0; }
-            }
-            String parseBareWord() {
-                int j=i; while (i<str.length()) {
-                    char c=str.charAt(i);
-                    if (Character.isLetterOrDigit(c)||c=='_'||c=='.'||c=='-') i++; else break;
-                } return str.substring(j,i);
-            }
-            void skipWs(){ while(i<str.length()){ char c=str.charAt(i); if(c==' '||c=='\n'||c=='\r'||c=='\t') i++; else break; } }
-            void expect(char ch) throws Exception { skipWs(); if (i>=str.length()||str.charAt(i)!=ch) throw new Exception("expected '"+ch+"'"); i++; }
-            char peek(){ return (i<str.length())?str.charAt(i):'\0'; }
-            boolean isDigit(char c){ return c>='0'&&c<='9'; }
-            String trimQuotes(String s){ if (s==null||s.length()<2) return s; char a=s.charAt(0), b=s.charAt(s.length()-1); if ((a=='"'&&b=='"')||(a=='\''&&b=='\'')) return s.substring(1,s.length()-1); return s; }
-        }
+    private static String toFlat(Map<String, Object> map) {
+        if (map == null) return "{}";
+        return map.toString();
     }
 }
