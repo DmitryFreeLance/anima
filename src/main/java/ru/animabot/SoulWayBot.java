@@ -18,24 +18,25 @@ import org.telegram.telegrambots.meta.api.objects.InputFile;
 
 import java.io.File;
 import java.net.URI;
-import java.text.Normalizer;
 import java.text.SimpleDateFormat;
 import java.util.*;
 import java.util.concurrent.*;
 
 /**
  * SoulWayBot:
- *  - /start: только приветствие с призывом ввести кодовое слово (без меню)
- *  - Меню показывается после выдачи бонуса (после подтверждения подписки)
- *  - Тарифы добавляют order_id, customer_extra и days к ссылкам Prodamus
- *  - Webhook Prodamus вызывает onProdamusPaid(uid, days) — там отправляем инвайт
+ *  - /start: только приветствие и призыв ввести код-слово (без меню)
+ *  - Код-слово → intro с кнопками ("Подписаться" в канал + "Уже подписан")
+ *  - "Уже подписан" → выдача бонуса + затем показ главного меню
+ *  - "Тарифы" → формируем ссылки Prodamus с customer_extra=<uid> и tar_days=<days>
+ *  - Webhook Prodamus → onProdamusPaid(uid, days) выдаёт подписку + шлёт инвайт в группу
+ *  - Периодическая очистка истёкших подписок
  */
 public class SoulWayBot extends TelegramLongPollingBot {
 
     private static final Logger LOG = LoggerFactory.getLogger(SoulWayBot.class);
 
     // ==== Ключи настроек ====
-    private static final String S_WELCOME_TEXT  = "welcome_text";
+    private static final String S_WELCOME_TEXT = "welcome_text";
     private static final String S_WELCOME_VIDEO = "welcome_video";
 
     private static final String S_CLUB_TEXT     = "club_text";
@@ -47,7 +48,7 @@ public class SoulWayBot extends TelegramLongPollingBot {
     private static final String S_PROCVETA_TEXT = "procveta_text";
     private static final String S_PROCVETA_URL  = "procveta_url";
 
-    // Тарифы
+    // Тарифы (лейблы / дни / ссылки Prodamus)
     private static final String S_TAR1_LABEL = "tariff1_label";
     private static final String S_TAR1_DAYS  = "tariff1_days";
     private static final String S_TAR1_URL   = "tariff1_url";
@@ -64,9 +65,9 @@ public class SoulWayBot extends TelegramLongPollingBot {
     private static final String S_GROUP_INVITE_URL = "group_invite_url";  // постоянная ссылка (если задана)
 
     // Бот / Админ / Канал
-    private final String BOT_TOKEN    = System.getenv().getOrDefault("TG_BOT_TOKEN", "CHANGE_ME");
+    private final String BOT_TOKEN    = System.getenv().getOrDefault("TG_BOT_TOKEN", "");
     private final String BOT_USERNAME = System.getenv().getOrDefault("TG_BOT_USERNAME", "SoulWayClub_bot");
-    private final long   ADMIN_ID     = Long.parseLong(System.getenv().getOrDefault("TG_ADMIN_ID", "0"));
+    private final long   ADMIN_ID     = Long.parseLong(System.getenv().getOrDefault("TG_ADMIN_ID", "726773708"));
     private final String CHANNEL_ID   = System.getenv().getOrDefault("TG_CHANNEL_ID", "sibirskaiapro"); // без @
 
     private final SQLiteManager db;
@@ -85,41 +86,45 @@ public class SoulWayBot extends TelegramLongPollingBot {
     }
 
     private void seedDefaults() {
-        // ТОЛЬКО приветствие для /start (без меню)
+        // Приветствие только текст (без меню)
         putIfEmpty(S_WELCOME_TEXT,
                 "👋 Привет! Это SoulWayClub Бот.\n\n" +
-                        "Введи кодовое слово и получи подарок 🎁\n\n" +
-                        "Я — пространство для глубокого погружения и слияния со своей Душой, " +
-                        "раскрытия силы, потенциалов и новых возможностей ✨\n\n" +
-                        "Готова почувствовать вкус жизни, энергию и вдохновение? Присоединяйся ❤️");
+                        "Введите кодовое слово — и получите подарок 🎁\n\n" +
+                        "Я — Анна Сибирская. Создала клуб «Путь души | Soul Way» для глубокого погружения, " +
+                        "раскрытия силы, потенциалов и новых возможностей ✨\n" +
+                        "После получения подарка вы увидите меню с подробностями о клубе и тарифами.");
 
         putIfEmpty(S_CLUB_TEXT,
                 "📘 О КЛУБЕ\n\n" +
-                        "— Доступ к практикам и медитациям\n" +
-                        "— Онлайн-встречи с проводником\n" +
-                        "— Общее поле поддержки и чат\n" +
-                        "— Ежедневные аффирмации\n");
+                        "Что ждёт в октябре:\n\n" +
+                        "✅ Доступ к записи трёх родовых практик\n" +
+                        "✅ Медитация «Энергетическая защита»\n" +
+                        "✅ Медитация «Состояние Изобилия»\n" +
+                        "✅ 2 онлайн-встречи с ченнелинг-медитациями\n" +
+                        "✅ Курс «Выбери Силу» (18 уроков)\n" +
+                        "✅ Медитация на гармонизацию состояний\n" +
+                        "✅ Алгоритм Нейрографики «Работа со страхом»\n" +
+                        "✅ Поддержка, чат, ответы на вопросы\n" +
+                        "✅ Ежедневные аффирмации\n\n" +
+                        "Бонус:\n" +
+                        "✅ Скидка 40% на личную сессию\n" +
+                        "✅ Медитация — настрой на гармоничный день.");
 
         putIfEmpty(S_REVIEWS_TEXT,  "📝 ОТЗЫВЫ\nЗдесь вы можете посмотреть отзывы:");
         putIfEmpty(S_REVIEWS_URL,   "https://t.me/sibirskaiapro/336");
-        putIfEmpty(S_ABOUT_TEXT,    "👤 ОБО МНЕ\n\nАнна Сибирская — энерготерапевт, ченнелер, проводник к жизни своей мечты.");
-        putIfEmpty(S_SESSIONS_TEXT, "🧘‍♀️ МОИ СЕАНСЫ\nЗдесь Вы можете ознакомиться с моими сеансами:");
-        putIfEmpty(S_SESSIONS_URL,  "https://t.me/sibirskaiapro/65");
-        putIfEmpty(S_PROCVETA_TEXT, "🌸 КЛУБ «ПРОЦВЕТАЙ»\nКлуб с живыми встречами в Санкт-Петербурге ❤️");
-        putIfEmpty(S_PROCVETA_URL,  "https://t.me/procvetaiclub");
+        putIfEmpty(S_ABOUT_TEXT,
+                "👤 ОБО МНЕ\n\n" +
+                        "Меня зовут Анна Сибирская — энерготерапевт, ченнелер, основатель клубов «Процветай» и «Путь души (Soul Way)». " +
+                        "Провожу сеансы и пишу энергетические картины 🌸");
+        putIfEmpty(S_SESSIONS_TEXT,"🧘‍♀️ МОИ СЕАНСЫ\nЗдесь Вы можете ознакомиться с моими сеансами:");
+        putIfEmpty(S_SESSIONS_URL, "https://t.me/sibirskaiapro/65");
+        putIfEmpty(S_PROCVETA_TEXT,"🌸 КЛУБ «ПРОЦВЕТАЙ»\nКлуб с живыми встречами в Санкт-Петербурге ❤️");
+        putIfEmpty(S_PROCVETA_URL, "https://t.me/procvetaiclub");
 
-        // Боевые 3 тарифа (тестовый 10 ₽ удалён)
-        putIfEmpty(S_TAR1_LABEL, "1 МЕС • 1299 ₽");
-        putIfEmpty(S_TAR1_DAYS,  "30");
-        putIfEmpty(S_TAR1_URL,   "https://payform.ru/4e9isVQ/");
-
-        putIfEmpty(S_TAR2_LABEL, "3 МЕС • 3599 ₽");
-        putIfEmpty(S_TAR2_DAYS,  "90");
-        putIfEmpty(S_TAR2_URL,   "https://payform.ru/en9it1j/");
-
-        putIfEmpty(S_TAR3_LABEL, "12 МЕС • 12900 ₽");
-        putIfEmpty(S_TAR3_DAYS,  "365");
-        putIfEmpty(S_TAR3_URL,   "https://payform.ru/kr9it4z/");
+        // Тарифы: сами тексты/дни/URL можно менять командами /settariff*
+        putIfEmpty(S_TAR1_LABEL, "1 МЕС • 1299 ₽"); putIfEmpty(S_TAR1_DAYS,  "30");  putIfEmpty(S_TAR1_URL, "https://payform.ru/4e9isVQ/");
+        putIfEmpty(S_TAR2_LABEL, "3 МЕС • 3599 ₽"); putIfEmpty(S_TAR2_DAYS,  "90");  putIfEmpty(S_TAR2_URL, "https://payform.ru/en9it1j/");
+        putIfEmpty(S_TAR3_LABEL, "12 МЕС • 12900 ₽"); putIfEmpty(S_TAR3_DAYS,"365"); putIfEmpty(S_TAR3_URL, "https://payform.ru/kr9it4z/");
     }
 
     private void putIfEmpty(String key, String value) {
@@ -128,7 +133,7 @@ public class SoulWayBot extends TelegramLongPollingBot {
     }
 
     @Override public String getBotUsername() { return BOT_USERNAME; }
-    @Override public String getBotToken()    { return BOT_TOKEN;     }
+    @Override public String getBotToken() { return BOT_TOKEN; }
 
     // ===================== Updates =====================
 
@@ -151,15 +156,11 @@ public class SoulWayBot extends TelegramLongPollingBot {
         String text = msg.hasText() ? msg.getText().trim() : "";
 
         try {
-            if (text.startsWith("/")) {
-                handleCommand(msg, text);
-                return;
-            }
+            if (text.startsWith("/")) { handleCommand(msg, text); return; }
 
             if (!text.isEmpty()) {
                 Keyword kw = db.findKeywordByKey(text);
                 if (kw != null) {
-                    // Показываем витрину кода (подписка + уже подписана)
                     SendMessage sm = new SendMessage();
                     sm.setChatId(String.valueOf(chatId));
                     sm.setText(nonEmpty(kw.getIntroText(), "🎁 Подарок:"));
@@ -178,19 +179,21 @@ public class SoulWayBot extends TelegramLongPollingBot {
         long chatId = msg.getChatId();
         long userId = msg.getFrom().getId();
         String[] parts = text.split(" ", 2);
-        String cmd  = parts[0].toLowerCase(Locale.ROOT);
+        String cmd = parts[0].toLowerCase(Locale.ROOT);
         String args = parts.length > 1 ? parts[1] : "";
 
         try {
             switch (cmd) {
                 case "/start": {
-                    // ТОЛЬКО приветствие без меню
-                    sendStartGreeting(chatId, msg.getFrom().getFirstName() != null ? msg.getFrom().getFirstName() : "друг");
+                    // Только приветствие (без меню)
+                    String welcome = db.getSetting(S_WELCOME_TEXT,
+                            "👋 Привет! Это SoulWayClub Бот.\nВведите кодовое слово — и получите подарок 🎁");
+                    sendWelcomeOnly(chatId, msg.getFrom().getFirstName(), welcome);
                     break;
                 }
                 case "/addkw": {
                     if (!isAdmin(userId)) { sendText(chatId, "Доступно только администратору."); return; }
-                    if (args.isBlank()) { sendText(chatId, "Формат: /addkw KEY|INTRO|REWARD|мат1,мат2"); return; }
+                    if (args.isBlank()) { sendText(chatId, "Формат: /addkw KEY|INTRO|REWARD|mat1,mat2"); return; }
                     String[] p = args.split("\\|", 4);
                     if (p.length < 3) { sendText(chatId, "Нужно минимум KEY|INTRO|REWARD"); return; }
                     Keyword kw = new Keyword();
@@ -199,7 +202,11 @@ public class SoulWayBot extends TelegramLongPollingBot {
                     kw.setRewardText(safeTrim(p[2]));
                     if (p.length == 4 && p[3] != null && !p[3].isBlank()) {
                         List<String> mats = new ArrayList<>();
-                        for (String s : p[3].split(",")) { String v = safeTrim(s); if (!v.isEmpty()) mats.add(v); }
+                        // поддержка запятых и сохранение пробелов/скобок/юникода
+                        for (String s : p[3].split(",")) {
+                            String v = s == null ? "" : s.strip();
+                            if (!v.isEmpty()) mats.add(v);
+                        }
                         kw.setMaterials(mats);
                     } else kw.setMaterials(Collections.emptyList());
                     db.upsertKeyword(kw);
@@ -219,10 +226,10 @@ public class SoulWayBot extends TelegramLongPollingBot {
                     break;
                 }
 
-                // ===== редактируемые тексты/ссылки =====
+                // редактируемые тексты/ссылки
                 case "/setwelcome":       if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_WELCOME_TEXT, args); sendText(chatId, "✅ Приветственный текст обновлён."); break;
                 case "/setwelcomevideo":  if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_WELCOME_VIDEO, args); sendText(chatId, "✅ Видео для приветствия обновлено."); break;
-                case "/setclub":          if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_CLUB_TEXT, args);     sendText(chatId, "✅ Текст «О Клубе» обновлён."); break;
+                case "/setclub":          if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_CLUB_TEXT, args);     sendText(chatId, "✅ Текст «О клубе» обновлён."); break;
                 case "/setreviews":       if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_REVIEWS_URL, args);   sendText(chatId, "✅ Ссылка «Отзывы» обновлена."); break;
                 case "/setreviews_text":  if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_REVIEWS_TEXT, args);  sendText(chatId, "✅ Текст «Отзывы» обновлён."); break;
                 case "/setabout":         if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_ABOUT_TEXT, args);    sendText(chatId, "✅ Текст «Обо мне» обновлён."); break;
@@ -231,16 +238,15 @@ public class SoulWayBot extends TelegramLongPollingBot {
                 case "/setprocveta":      if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_PROCVETA_URL, args);  sendText(chatId, "✅ Ссылка «Клуб Процветай» обновлена."); break;
                 case "/setprocveta_text": if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_PROCVETA_TEXT, args); sendText(chatId, "✅ Текст «Клуб Процветай» обновлён."); break;
 
-                // ===== Тарифы (лейбл/дни/URL) =====
-                case "/settariff1": { // LABEL|DAYS|URL
+                // тарифы
+                case "/settariff1": {
                     if (!isAdmin(userId)) { deny(chatId); break; }
                     String[] a = args.split("\\|", 3);
                     if (a.length < 3) { sendText(chatId, "Формат: /settariff1 LABEL|DAYS|URL"); break; }
                     db.setSetting(S_TAR1_LABEL, a[0].trim());
                     db.setSetting(S_TAR1_DAYS,  a[1].trim());
                     db.setSetting(S_TAR1_URL,   a[2].trim());
-                    sendText(chatId, "✅ Тариф #1 сохранён.");
-                    break;
+                    sendText(chatId, "✅ Тариф #1 сохранён."); break;
                 }
                 case "/settariff2": {
                     if (!isAdmin(userId)) { deny(chatId); break; }
@@ -249,8 +255,7 @@ public class SoulWayBot extends TelegramLongPollingBot {
                     db.setSetting(S_TAR2_LABEL, a[0].trim());
                     db.setSetting(S_TAR2_DAYS,  a[1].trim());
                     db.setSetting(S_TAR2_URL,   a[2].trim());
-                    sendText(chatId, "✅ Тариф #2 сохранён.");
-                    break;
+                    sendText(chatId, "✅ Тариф #2 сохранён."); break;
                 }
                 case "/settariff3": {
                     if (!isAdmin(userId)) { deny(chatId); break; }
@@ -259,11 +264,10 @@ public class SoulWayBot extends TelegramLongPollingBot {
                     db.setSetting(S_TAR3_LABEL, a[0].trim());
                     db.setSetting(S_TAR3_DAYS,  a[1].trim());
                     db.setSetting(S_TAR3_URL,   a[2].trim());
-                    sendText(chatId, "✅ Тариф #3 сохранён.");
-                    break;
+                    sendText(chatId, "✅ Тариф #3 сохранён."); break;
                 }
 
-                // ===== Группа / Сервисные =====
+                // Группа / сервисные
                 case "/setgroup":     if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_GROUP_ID, args.trim());         sendText(chatId, "✅ ID группы сохранён."); break;
                 case "/setgrouplink": if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_GROUP_INVITE_URL, args.trim()); sendText(chatId, "✅ Инвайт-ссылка группы сохранена."); break;
                 case "/grantsub": {
@@ -320,13 +324,8 @@ public class SoulWayBot extends TelegramLongPollingBot {
                 Keyword kw = db.findKeywordByKey(key);
                 if (kw == null) { answerCallback(cb.getId(), "Кодовое слово не найдено."); return; }
                 answerCallback(cb.getId(), "✅ Подписка подтверждена!");
-
-                // 1) Даём материалы
-                sendReward(chatId, kw);
-
-                // 2) Показываем меню ОДИН раз (после выдачи бонуса)
-                String firstName = cb.getFrom().getFirstName() != null ? cb.getFrom().getFirstName() : "друг";
-                sendWelcomeWithMenu(chatId, firstName);
+                sendReward(chatId, kw);                       // выдаём материалы
+                showMainMenu(chatId, cb.getFrom().getFirstName()); // и ТОЛЬКО теперь меню
                 return;
             }
 
@@ -375,8 +374,7 @@ public class SoulWayBot extends TelegramLongPollingBot {
                     break;
                 }
                 case CB_MENU_BACK: {
-                    String firstName = cb.getFrom().getFirstName() != null ? cb.getFrom().getFirstName() : "друг";
-                    sendWelcomeWithMenu(chatId, firstName);
+                    showMainMenu(chatId, cb.getFrom().getFirstName());
                     answerCallback(cb.getId(), "");
                     break;
                 }
@@ -389,49 +387,37 @@ public class SoulWayBot extends TelegramLongPollingBot {
         }
     }
 
-    // ===================== Приветствия и меню =====================
+    // ===================== Витрины и меню =====================
 
-    /** /start — только приветственный текст, без меню */
-    private void sendStartGreeting(long chatId, String userName) {
-        String raw = db.getSetting(S_WELCOME_TEXT,
-                "👋 Привет! Это SoulWayClub Бот.\nВведи кодовое слово и получи подарок 🎁");
-        String text = raw.replace("{name}", userName);
+    private InlineKeyboardMarkup buildIntroKeyboard(Keyword kw) {
+        InlineKeyboardButton subscribe = new InlineKeyboardButton();
+        subscribe.setText("📢 Подписаться");
+        subscribe.setUrl("https://t.me/" + CHANNEL_ID);
 
-        // Если задано видео — пришлём именно видео (без меню)
-        String videoRef = db.getSetting(S_WELCOME_VIDEO, null);
-        if (videoRef != null && !videoRef.isBlank()) {
-            try {
-                SendVideo sv = new SendVideo();
-                sv.setChatId(String.valueOf(chatId));
+        InlineKeyboardButton already = new InlineKeyboardButton();
+        already.setText("✅ Уже подписан(а)");
+        already.setCallbackData(CB_CHECKSUB_PREFIX + kw.getKeyword());
 
-                File f = resolveLocalPath(videoRef);
-                if (f != null && f.exists() && f.isFile()) {
-                    sv.setVideo(new InputFile(f, f.getName()));
-                } else {
-                    if (isHttpUrl(videoRef)) sv.setVideo(new InputFile(normalizeUrl(videoRef)));
-                    else                     sv.setVideo(new InputFile(videoRef)); // file_id
-                }
-                sv.setCaption(text);
-                execute(sv);
-                return;
-            } catch (Exception e) {
-                LOG.warn("Не удалось отправить стартовое видео: {}", e.getMessage());
-            }
-        }
+        List<List<InlineKeyboardButton>> rows = new ArrayList<>();
+        rows.add(Arrays.asList(subscribe, already));
 
-        // Текст без меню
-        sendText(chatId, text);
+        InlineKeyboardMarkup kb = new InlineKeyboardMarkup();
+        kb.setKeyboard(rows);
+        return kb;
     }
 
-    /** Привет + меню (показываем ПОСЛЕ выдачи бонуса) */
-    private void sendWelcomeWithMenu(long chatId, String userName) {
-        String text =
-                "✨ Добро пожаловать, {name}!\n\n" +
-                        "Выбирай раздел ниже, чтобы посмотреть наполнение клуба, отзывы, тарифы и статус подписки.";
-        text = text.replace("{name}", userName);
+    /** Отправляем только приветственный текст (без меню) */
+    private void sendWelcomeOnly(long chatId, String userName, String welcomeText) {
+        String text = welcomeText.replace("{name}", userName != null ? userName : "друг");
+        safeExec(new SendMessage(String.valueOf(chatId), text));
+    }
 
+    /** Показ главного меню (после выдачи бонуса) */
+    private void showMainMenu(long chatId, String userName) {
+        String raw = db.getSetting(S_WELCOME_TEXT, "{name}, приветствую тебя!");
+        String text = raw.replace("{name}", userName != null ? userName : "друг");
         InlineKeyboardMarkup menu = buildMainMenu();
-        SendMessage sm = new SendMessage(String.valueOf(chatId), text);
+        SendMessage sm = new SendMessage(String.valueOf(chatId), "Главное меню:");
         sm.setReplyMarkup(menu);
         safeExec(sm);
     }
@@ -445,14 +431,18 @@ public class SoulWayBot extends TelegramLongPollingBot {
         rows.add(List.of(btn("🧘‍♀️ МОИ СЕАНСЫ", CB_MENU_SESS)));
         rows.add(List.of(btn("🎫 ВАША ПОДПИСКА", CB_MENU_SUB)));
         rows.add(List.of(btn("🌸 КЛУБ «ПРОЦВЕТАЙ»", CB_MENU_PROCV)));
-        return new InlineKeyboardMarkup(rows);
+        InlineKeyboardMarkup kb = new InlineKeyboardMarkup();
+        kb.setKeyboard(rows);
+        return kb;
     }
 
     private InlineKeyboardMarkup buildClubMenu() {
         List<List<InlineKeyboardButton>> rows = new ArrayList<>();
         rows.add(List.of(btn("💳 ТАРИФЫ", CB_MENU_TARIFF)));
         rows.add(List.of(btn("⬅️ Вернуться в начальное меню", CB_MENU_BACK)));
-        return new InlineKeyboardMarkup(rows);
+        InlineKeyboardMarkup kb = new InlineKeyboardMarkup();
+        kb.setKeyboard(rows);
+        return kb;
     }
 
     private InlineKeyboardMarkup addBackButton(InlineKeyboardMarkup kb) {
@@ -484,56 +474,28 @@ public class SoulWayBot extends TelegramLongPollingBot {
         safeExec(sm);
     }
 
-    /** КНОПКИ ПОДПИСКИ ПОД КОДОВЫМ СЛОВОМ */
-    private InlineKeyboardMarkup buildIntroKeyboard(Keyword kw) {
-        InlineKeyboardButton subscribe = new InlineKeyboardButton();
-        subscribe.setText("📢 Подписаться на канал");
-        subscribe.setUrl("https://t.me/" + CHANNEL_ID);
-
-        InlineKeyboardButton already = new InlineKeyboardButton();
-        already.setText("✅ Уже подписана");
-        already.setCallbackData(CB_CHECKSUB_PREFIX + kw.getKeyword());
-
-        List<List<InlineKeyboardButton>> rows = new ArrayList<>();
-        rows.add(Arrays.asList(subscribe, already));
-
-        InlineKeyboardMarkup kb = new InlineKeyboardMarkup();
-        kb.setKeyboard(rows);
-        return kb;
-    }
-
-    /** Генерим кнопки тарифов: добавляем order_id, customer_extra и days */
+    /** Тарифы: ссылки с customer_extra=<uid> и tar_days=<days> */
     private void sendTariffs(long chatId, long userId, boolean withBack) {
         String l1 = db.getSetting(S_TAR1_LABEL, "1 МЕС • 1299 ₽");
-        int    d1 = safeParseInt(db.getSetting(S_TAR1_DAYS, "30"), 30);
-        String u1 = db.getSetting(S_TAR1_URL,  "https://payform.ru/4e9isVQ/");
+        int d1 = safeParseInt(db.getSetting(S_TAR1_DAYS, "30"), 30);
+        String u1 = db.getSetting(S_TAR1_URL, "https://payform.ru/4e9isVQ/");
 
         String l2 = db.getSetting(S_TAR2_LABEL, "3 МЕС • 3599 ₽");
-        int    d2 = safeParseInt(db.getSetting(S_TAR2_DAYS, "90"), 90);
-        String u2 = db.getSetting(S_TAR2_URL,  "https://payform.ru/en9it1j/");
+        int d2 = safeParseInt(db.getSetting(S_TAR2_DAYS, "90"), 90);
+        String u2 = db.getSetting(S_TAR2_URL, "https://payform.ru/en9it1j/");
 
         String l3 = db.getSetting(S_TAR3_LABEL, "12 МЕС • 12900 ₽");
-        int    d3 = safeParseInt(db.getSetting(S_TAR3_DAYS, "365"), 365);
-        String u3 = db.getSetting(S_TAR3_URL,  "https://payform.ru/kr9it4z/");
+        int d3 = safeParseInt(db.getSetting(S_TAR3_DAYS, "365"), 365);
+        String u3 = db.getSetting(S_TAR3_URL, "https://payform.ru/kr9it4z/");
 
-        Map<String, String> qp1 = new LinkedHashMap<>();
-        qp1.put("order_id", String.valueOf(userId));
-        qp1.put("customer_extra", String.valueOf(userId));
-        qp1.put("days", String.valueOf(d1));
+        // кастомные параметры, чтобы Prodamus вернул их в webhook как есть
+        Map<String,String> q1 = Map.of("customer_extra", String.valueOf(userId), "tar_days", String.valueOf(d1));
+        Map<String,String> q2 = Map.of("customer_extra", String.valueOf(userId), "tar_days", String.valueOf(d2));
+        Map<String,String> q3 = Map.of("customer_extra", String.valueOf(userId), "tar_days", String.valueOf(d3));
 
-        Map<String, String> qp2 = new LinkedHashMap<>();
-        qp2.put("order_id", String.valueOf(userId));
-        qp2.put("customer_extra", String.valueOf(userId));
-        qp2.put("days", String.valueOf(d2));
-
-        Map<String, String> qp3 = new LinkedHashMap<>();
-        qp3.put("order_id", String.valueOf(userId));
-        qp3.put("customer_extra", String.valueOf(userId));
-        qp3.put("days", String.valueOf(d3));
-
-        String link1 = appendParams(u1, qp1);
-        String link2 = appendParams(u2, qp2);
-        String link3 = appendParams(u3, qp3);
+        String link1 = appendParams(u1, q1);
+        String link2 = appendParams(u2, q2);
+        String link3 = appendParams(u3, q3);
 
         InlineKeyboardButton b1 = new InlineKeyboardButton(l1 + " • оплатить"); b1.setUrl(link1);
         InlineKeyboardButton b2 = new InlineKeyboardButton(l2 + " • оплатить"); b2.setUrl(link2);
@@ -545,12 +507,12 @@ public class SoulWayBot extends TelegramLongPollingBot {
         rows.add(List.of(b3));
         if (withBack) rows.add(Collections.singletonList(btn("⬅️ Вернуться в начальное меню", CB_MENU_BACK)));
 
-        InlineKeyboardMarkup kb = new InlineKeyboardMarkup(rows);
+        InlineKeyboardMarkup kb = new InlineKeyboardMarkup();
+        kb.setKeyboard(rows);
 
-        String intro =
-                "💳 ТАРИФЫ\n\n" +
-                        "Здесь ты можешь выбрать тариф и оформить участие👇🏻\n\n" +
-                        "P.S. Сразу после оплаты я пришлю приглашение в закрытый чат.";
+        String intro = "💳 ТАРИФЫ\n\n" +
+                "Выбирайте тариф и оформляйте участие 👇🏻\n\n" +
+                "P.S. Сразу после оплаты пришлю приглашение в закрытый чат.";
 
         SendMessage sm = new SendMessage(String.valueOf(chatId), intro);
         sm.setReplyMarkup(kb);
@@ -569,16 +531,17 @@ public class SoulWayBot extends TelegramLongPollingBot {
 
         List<List<InlineKeyboardButton>> rows = new ArrayList<>();
         if (withBack) rows.add(Collections.singletonList(btn("⬅️ Вернуться в начальное меню", CB_MENU_BACK)));
-        InlineKeyboardMarkup kb = new InlineKeyboardMarkup(rows);
+        InlineKeyboardMarkup kb = new InlineKeyboardMarkup();
+        kb.setKeyboard(rows);
 
         SendMessage sm = new SendMessage(String.valueOf(chatId), "🎫 ВАША ПОДПИСКА\n" + status);
         sm.setReplyMarkup(kb);
         safeExec(sm);
     }
 
-    // ===================== Prodamus: обработка платежа =====================
+    // ===================== Prodamus: после успешной оплаты =====================
 
-    /** Вызывается вебсервером вебхуков после успешной верификации подписи. */
+    /** Вызывается вебсервером вебхуков после успешной верификации и парсинга. */
     public void onProdamusPaid(long uid, int days) {
         try {
             db.grantSubscription(uid, days);
@@ -637,40 +600,35 @@ public class SoulWayBot extends TelegramLongPollingBot {
 
     // ===================== Награда (фото/документы) =====================
 
-    /** Только материалы: если есть cover-фото — шлём фото отдельным сообщением с подписью; затем документы. */
     private void sendReward(long chatId, Keyword kw) {
         try {
             List<String> materials = kw.getMaterials();
             String rewardText = safeTrim(kw.getRewardText());
-
             if (materials == null || materials.isEmpty()) {
                 if (!rewardText.isEmpty()) sendText(chatId, rewardText);
-                return;
+                return; // меню покажем отдельно
             }
-
             String image = null;
             List<String> docs = new ArrayList<>();
             for (String m : materials) {
                 if (m == null || m.isBlank()) continue;
-                String v = m.trim();
+                String v = m.strip();
                 if (isImageSpec(v)) { if (image == null) image = stripImgPrefix(v); else docs.add(v); }
                 else docs.add(v);
             }
-
-            // 1) Если есть обложка — отправляем её с подписью
-            if (image != null) {
+            if (image != null && docs.isEmpty()) {
                 sendSinglePhoto(chatId, image, rewardText);
-            } else if (!rewardText.isEmpty()) {
-                // иначе — просто подпись до документов
-                sendText(chatId, rewardText);
+                return;
             }
-
-            // 2) Затем документы
-            if (!docs.isEmpty()) {
-                // Надёжно: отправляем по одному (альбомы с локальными файлами часто падают)
-                for (String d : docs) sendSingleDocument(chatId, d);
+            if (image != null) {
+                List<InputMedia> firstBatch = new ArrayList<>();
+                InputMediaPhoto cover = buildInputMediaPhoto(image, rewardText);
+                firstBatch.add(cover);
+                sendMediaInBatches(chatId, firstBatch, docs);
+            } else {
+                if (!rewardText.isEmpty()) sendText(chatId, rewardText);
+                sendDocumentsSmart(chatId, docs);
             }
-
         } catch (Exception e) {
             LOG.error("sendReward error", e);
         }
@@ -678,8 +636,7 @@ public class SoulWayBot extends TelegramLongPollingBot {
 
     private void sendSinglePhoto(long chatId, String ref, String caption) {
         try {
-            InputFile file = toInputFile(ref);
-            SendPhoto sp = new SendPhoto(String.valueOf(chatId), file);
+            SendPhoto sp = new SendPhoto(String.valueOf(chatId), toInputFile(ref));
             if (caption != null && !caption.isBlank()) sp.setCaption(caption);
             execute(sp);
         } catch (Exception e) {
@@ -687,6 +644,52 @@ public class SoulWayBot extends TelegramLongPollingBot {
             if (caption != null && !caption.isBlank()) sendText(chatId, caption);
             sendText(chatId, "Материал: " + ref);
         }
+    }
+
+    private void sendDocumentsSmart(long chatId, List<String> docs) {
+        if (docs == null || docs.isEmpty()) return;
+        if (docs.size() == 1) { sendSingleDocument(chatId, docs.get(0)); }
+        else { sendDocumentsAsAlbums(chatId, docs); }
+    }
+
+    private void sendDocumentsAsAlbums(long chatId, List<String> docs) {
+        int i = 0;
+        while (i < docs.size()) {
+            int batchSize = Math.min(10, docs.size() - i);
+            if (batchSize == 1) { sendSingleDocument(chatId, docs.get(i)); i++; continue; }
+            List<InputMedia> pack = new ArrayList<>(batchSize);
+            for (int j = 0; j < batchSize; j++) pack.add(buildInputMediaDocument(docs.get(i + j)));
+            try {
+                SendMediaGroup smg = new SendMediaGroup(String.valueOf(chatId), pack);
+                execute(smg);
+            } catch (Exception ex) {
+                LOG.warn("Альбом документов не отправился, fallback по одному: {}", ex.getMessage());
+                for (int j = 0; j < batchSize; j++) sendSingleDocument(chatId, docs.get(i + j));
+            }
+            i += batchSize;
+        }
+    }
+
+    private void sendMediaInBatches(long chatId, List<InputMedia> firstBatch, List<String> docs) {
+        int idx = 0, room = Math.max(0, 10 - firstBatch.size());
+        List<InputMedia> batch = new ArrayList<>(firstBatch);
+        while (idx < docs.size() && room-- > 0) batch.add(buildInputMediaDocument(docs.get(idx++)));
+        try {
+            if (batch.size() < 2) {
+                InputMedia first = batch.get(0);
+                sendSinglePhoto(chatId, extractMediaRef(first), (first instanceof InputMediaPhoto) ? ((InputMediaPhoto) first).getCaption() : null);
+            } else {
+                SendMediaGroup smg = new SendMediaGroup(String.valueOf(chatId), batch);
+                execute(smg);
+            }
+        } catch (Exception ex) {
+            LOG.warn("Не удалось отправить альбом (с фото), fallback: {}", ex.getMessage());
+            InputMedia first = firstBatch.get(0);
+            String caption = (first instanceof InputMediaPhoto) ? ((InputMediaPhoto) first).getCaption() : null;
+            sendSinglePhoto(chatId, extractMediaRef(first), caption);
+            if (idx < docs.size()) sendDocumentsSmart(chatId, docs.subList(idx, docs.size()));
+        }
+        if (idx < docs.size()) sendDocumentsSmart(chatId, docs.subList(idx, docs.size()));
     }
 
     private void sendSingleDocument(long chatId, String ref) {
@@ -699,8 +702,14 @@ public class SoulWayBot extends TelegramLongPollingBot {
         }
     }
 
+    private InputMediaPhoto buildInputMediaPhoto(String ref, String caption) {
+        InputMediaPhoto photo = new InputMediaPhoto();
+        photo.setMedia(ref);
+        if (caption != null && !caption.isBlank()) photo.setCaption(caption);
+        return photo;
+    }
+
     private InputMediaDocument buildInputMediaDocument(String ref) {
-        // Оставлено на случай, если захочешь альбом из URL/file_id
         InputMediaDocument doc = new InputMediaDocument();
         doc.setMedia(ref);
         return doc;
@@ -734,54 +743,13 @@ public class SoulWayBot extends TelegramLongPollingBot {
         } catch (Exception e) { LOG.error("answerCallback error", e); }
     }
 
-    private static boolean isHttpUrl(String s) {
-        if (s == null) return false;
-        String v = s.trim().toLowerCase(Locale.ROOT);
-        return v.startsWith("http://") || v.startsWith("https://");
-    }
+    private static String extractMediaRef(InputMedia im) { return im.getMedia(); }
 
-    /** Аккуратно ищем файл: ./, ./files/, NFC/NFD, /work/files/ */
-    private File resolveLocalPath(String ref) {
-        if (ref == null || ref.isBlank()) return null;
-
-        File direct = new File(ref);
-        if (direct.exists()) return direct;
-
-        if (!ref.startsWith("/") && !ref.startsWith("./")) {
-            File underFiles = new File("./files/" + ref);
-            if (underFiles.exists()) return underFiles;
-        }
-
-        try {
-            String nfc = Normalizer.normalize(ref, Normalizer.Form.NFC);
-            String nfd = Normalizer.normalize(ref, Normalizer.Form.NFD);
-            if (!nfc.equals(ref)) {
-                File f1 = new File(nfc);
-                if (f1.exists()) return f1;
-                File f1b = new File("./files/" + nfc);
-                if (f1b.exists()) return f1b;
-            }
-            if (!nfd.equals(ref)) {
-                File f2 = new File(nfd);
-                if (f2.exists()) return f2;
-                File f2b = new File("./files/" + nfd);
-                if (f2b.exists()) return f2b;
-            }
-        } catch (Exception ignore) {}
-
-        File fromWork = new File("/work/files/" + ref);
-        if (fromWork.exists()) return fromWork;
-
-        return null;
-    }
-
-    private InputFile toInputFile(String ref) {
-        if (isHttpUrl(ref)) return new InputFile(normalizeUrl(ref));
-
-        File f = resolveLocalPath(ref);
-        if (f != null && f.exists() && f.isFile()) return new InputFile(f, f.getName());
-
-        return new InputFile(ref); // file_id или сырой ref
+    private static InputFile toInputFile(String ref) {
+        File f = new File(ref);
+        if (f.exists() && f.isFile()) return new InputFile(f, f.getName());
+        if (ref.startsWith("http://") || ref.startsWith("https://")) return new InputFile(normalizeUrl(ref));
+        return new InputFile(ref); // file_id (Telegram)
     }
 
     private static String appendParams(String base, Map<String,String> q) {
