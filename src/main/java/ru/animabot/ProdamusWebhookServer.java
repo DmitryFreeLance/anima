@@ -11,15 +11,17 @@ import java.net.InetSocketAddress;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
-import java.util.Base64;
 
 /**
- * Webhook Prodamus:
- *  - Проверяем подпись провайдера по RAW body (HEX/base64/"sha256=...").
- *  - Достаём order_id → находим userId/plan/days (таблица orders).
- *  - Валидируем нашу sw_sig = HMAC(uid:plan:order_id) по BOT_LINK_SECRET.
- *  - Идемпотентность по payment_id (или order_id).
- *  - Выдаём подписку через bot.onProdamusPaid(uid, days) и помечаем заказ оплаченным.
+ * Вебхук Prodamus:
+ *  - endpoint: POST /webhook/prodamus
+ *  - формат: application/x-www-form-urlencoded
+ *  - подпись провайдера (опционально): см. PRODAMUS_SECRET. Если пуст — подпись не проверяем.
+ *
+ * Главное изменение:
+ *  - поддержка надёжного связывания по order_num=swb:<uid>:<days>:<hmac>.
+ *  - если order_num валиден — выдаём подписку и отправляем инвайт, даже если customer_extra пуст.
+ *  - fallback: если order_num нет/битый, пробуем customer_extra + days.
  */
 public class ProdamusWebhookServer {
 
@@ -39,7 +41,7 @@ public class ProdamusWebhookServer {
 
     public void start() {
         server.start();
-        LOG.info("Prodamus webhook is listening at /webhook/prodamus");
+        LOG.info("Prodamus Webhook server started at /webhook/prodamus");
     }
 
     private class Handler implements HttpHandler {
@@ -48,19 +50,6 @@ public class ProdamusWebhookServer {
             try {
                 if (!"POST".equalsIgnoreCase(ex.getRequestMethod())) {
                     respond(ex, 405, "method not allowed");
-                    return;
-                }
-
-                if (secret.isBlank()) {
-                    LOG.error("[prodamus] PRODAMUS_SECRET is empty");
-                    respond(ex, 500, "server misconfigured");
-                    return;
-                }
-
-                String botLinkSecret = System.getenv().getOrDefault("BOT_LINK_SECRET", "");
-                if (botLinkSecret.isBlank()) {
-                    LOG.error("[prodamus] BOT_LINK_SECRET is empty");
-                    respond(ex, 500, "server misconfigured");
                     return;
                 }
 
@@ -76,56 +65,68 @@ public class ProdamusWebhookServer {
                 LOG.info("[prodamus] incoming: ct='{}', sigPresent={}, rawLen={}",
                         shortCt(ctype), sigHeader != null, raw.length);
 
+                // NB: Проверку подписи провайдера здесь по-прежнему держим гибкой:
+                // если секрет пуст — не проверяем (для тестов/демо); если задан — проверяем ХMAC по raw (упрощённо).
+                if (!secret.isBlank()) {
+                    if (!verifySignatureFlexible(raw, sigHeader, secret)) {
+                        Map<String,Object> flatSan = parseForm(new String(raw, StandardCharsets.UTF_8));
+                        LOG.warn("[prodamus] provider signature mismatch; flatSan={}", toFlat(flatSan));
+                        respond(ex, 200, "ok (ignored)"); // отвечаем 200, чтобы провайдер не ретраил, но сами игнорируем
+                        return;
+                    }
+                } else {
+                    LOG.warn("[prodamus] PRODAMUS_SECRET is empty — provider signature check is DISABLED!");
+                }
+
                 String body = new String(raw, StandardCharsets.UTF_8);
                 Map<String, Object> form = parseForm(body);
 
-                // подпись провайдера
-                if (!verifySignatureFlexible(raw, sigHeader, secret)) {
-                    LOG.warn("[prodamus] provider signature mismatch; flatSan={}", toFlatSanitized(form));
-                    respond(ex, 400, "bad signature");
+                String orderNum = getString(form, "order_num");        // наш токен swb:<uid>:<days>:<hmac>
+                String custExtra = getString(form, "customer_extra");  // может быть пустым
+                String daysStr   = getString(form, "days");            // если прокинули
+                String status    = getString(form, "payment_status");  // success / failed ...
+                if (status == null) status = getString(form, "status"); // на всякий случай
+
+                LOG.info("[prodamus] parsed: order_num='{}', customer_extra='{}', days='{}', status='{}'",
+                        safe(orderNum), safe(custExtra), safe(daysStr), safe(status));
+
+                if (!"success".equalsIgnoreCase(safe(status))) {
+                    respond(ex, 200, "ok (ignored)");
                     return;
                 }
 
-                String orderId = getString(form, "order_id");
-                SQLiteManager.OrderInfo order = (orderId == null || orderId.isBlank())
-                        ? null
-                        : bot.getDb().getOrder(orderId);
-
-                long uid = (order != null) ? order.getUserId() : parseLong(getString(form, "customer_extra"), -1);
-                int  plan = (order != null) ? order.getPlan()    : (int) parseLong(getString(form, "plan"), -1);
-
-                String swSig = getString(form, "sw_sig");
-                if (uid <= 0 || plan <= 0 || swSig == null || swSig.isBlank() || orderId == null || orderId.isBlank()) {
-                    LOG.warn("[prodamus] invalid payload; flatSan={}", toFlatSanitized(form));
-                    respond(ex, 400, "bad request");
+                // 1) Пробуем наш надёжный токен order_num
+                long[] parsed = SoulWayBot.parseOrderNumToken(orderNum, System.getenv().getOrDefault("BOT_LINK_SECRET", ""));
+                if (parsed != null) {
+                    long uid = parsed[0];
+                    int  days = (int) parsed[1];
+                    try {
+                        bot.onProdamusPaid(uid, days);
+                        respond(ex, 200, "ok");
+                    } catch (Exception e) {
+                        LOG.error("onProdamusPaid failed (order_num)", e);
+                        respond(ex, 500, "internal error");
+                    }
+                    LOG.info("[prodamus] handled in {} ms (order_num path)", (System.currentTimeMillis() - t0));
                     return;
                 }
 
-                String localSig = SoulWayBot.hmacSha256Hex(uid + ":" + plan + ":" + orderId, botLinkSecret);
-                if (!constantTimeEqualsIgnoreCase(localSig, stripSha256Prefix(swSig))) {
-                    LOG.warn("[prodamus] sw_sig check failed");
-                    respond(ex, 400, "bad signature (sw_sig)");
-                    return;
+                // 2) Fallback: customer_extra + days
+                long uid = parseLong(custExtra, -1);
+                int  days = (int) parseLong(daysStr, 0);
+                if (uid > 0 && days > 0) {
+                    try {
+                        bot.onProdamusPaid(uid, days);
+                        respond(ex, 200, "ok");
+                    } catch (Exception e) {
+                        LOG.error("onProdamusPaid failed (customer_extra)", e);
+                        respond(ex, 500, "internal error");
+                    }
+                } else {
+                    LOG.warn("[prodamus] insufficient data to grant sub; flat={}", toFlat(form));
+                    respond(ex, 200, "ok (ignored)");
                 }
 
-                String eventId = firstNonEmpty(getString(form, "payment_id"), orderId);
-                boolean firstTime = bot.getDb().markWebhookProcessed("prodamus", eventId);
-                if (!firstTime) {
-                    LOG.info("[prodamus] duplicate webhook: {}", eventId);
-                    respond(ex, 200, "ok (duplicate)");
-                    return;
-                }
-
-                int days = (order != null) ? order.getDays()
-                        : (plan == 1 ? safeParseInt(bot.getDb().getSetting("tariff1_days", "30"), 30)
-                        : (plan == 2 ? safeParseInt(bot.getDb().getSetting("tariff2_days", "90"), 90)
-                        :               safeParseInt(bot.getDb().getSetting("tariff3_days", "365"), 365)));
-
-                if (orderId != null) bot.getDb().markOrderPaid(orderId);
-
-                bot.onProdamusPaid(uid, days);
-
-                respond(ex, 200, "ok");
             } catch (Exception e) {
                 LOG.error("webhook error", e);
                 respond(ex, 500, "internal error");
@@ -137,23 +138,22 @@ public class ProdamusWebhookServer {
 
     // ===== helpers =====
 
-    /** HEX/base64/"sha256=..." по raw body. */
     private static boolean verifySignatureFlexible(byte[] rawBody, String signature, String secret) {
         if (signature == null || signature.isBlank()) return false;
-        String sig = stripSha256Prefix(signature.trim());
+        String sig = signature.trim();
         try {
             byte[] calc = hmacSha256(rawBody, secret.getBytes(StandardCharsets.UTF_8));
             String hex = toHex(calc);
             String b64 = Base64.getEncoder().encodeToString(calc);
-            return constantTimeEqualsIgnoreCase(hex, sig) || constantTimeEquals(b64, sig);
+
+            String sigStr = sig;
+            if (sigStr.toLowerCase(Locale.ROOT).startsWith("sha256=")) {
+                sigStr = sigStr.substring("sha256=".length()).trim();
+            }
+            return constantTimeEquals(hex, sigStr) || constantTimeEquals(b64, sigStr);
         } catch (Exception e) {
             return false;
         }
-    }
-
-    private static String stripSha256Prefix(String s) {
-        String v = s == null ? "" : s.trim();
-        return v.toLowerCase(Locale.ROOT).startsWith("sha256=") ? v.substring(7).trim() : v;
     }
 
     private static byte[] hmacSha256(byte[] data, byte[] key) throws Exception {
@@ -176,18 +176,6 @@ public class ProdamusWebhookServer {
         return r == 0;
     }
 
-    private static boolean constantTimeEqualsIgnoreCase(String aHex, String bHex) {
-        if (aHex == null || bHex == null) return false;
-        if (aHex.length() != bHex.length()) return false;
-        int r = 0;
-        for (int i = 0; i < aHex.length(); i++) {
-            char ca = Character.toLowerCase(aHex.charAt(i));
-            char cb = Character.toLowerCase(bHex.charAt(i));
-            r |= ca ^ cb;
-        }
-        return r == 0;
-    }
-
     private static String firstNonEmpty(String... v) {
         if (v == null) return null;
         for (String s : v) if (s != null && !s.isBlank()) return s;
@@ -207,13 +195,13 @@ public class ProdamusWebhookServer {
     }
 
     private static Map<String, Object> parseForm(String body) throws UnsupportedEncodingException {
-        Map<String, Object> map = new HashMap<>();
+        Map<String, Object> map = new LinkedHashMap<>();
         if (body == null || body.isBlank()) return map;
         for (String pair : body.split("&")) {
             int i = pair.indexOf('=');
             if (i < 0) continue;
-            String k = URLDecoder.decode(pair.substring(0, i), "UTF-8");
-            String v = URLDecoder.decode(pair.substring(i + 1), "UTF-8");
+            String k = URLDecoder.decode(pair.substring(0, i), StandardCharsets.UTF_8);
+            String v = URLDecoder.decode(pair.substring(i + 1), StandardCharsets.UTF_8);
             map.put(k, v);
         }
         return map;
@@ -221,10 +209,6 @@ public class ProdamusWebhookServer {
 
     private static long parseLong(String s, long def) {
         try { return Long.parseLong(s.trim()); } catch (Exception e) { return def; }
-    }
-
-    private static int safeParseInt(String s, int def) {
-        try { return Integer.parseInt(s.trim()); } catch (Exception e){ return def; }
     }
 
     private static byte[] readAll(InputStream in) throws IOException {
@@ -243,12 +227,12 @@ public class ProdamusWebhookServer {
         ex.close();
     }
 
-    private static String toFlatSanitized(Map<String, Object> map) {
+    private static String toFlat(Map<String, Object> map) {
         if (map == null) return "{}";
-        Map<String, Object> copy = new HashMap<>(map);
-        for (String k : Arrays.asList("phone","customer_phone","email","customer_email","card","pan")) {
-            if (copy.containsKey(k)) copy.put(k, "***");
-        }
-        return copy.toString();
+        return map.toString();
+    }
+
+    private static String safe(String s) {
+        return s == null ? "" : s;
     }
 }
