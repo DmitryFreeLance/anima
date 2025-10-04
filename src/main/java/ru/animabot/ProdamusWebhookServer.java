@@ -14,14 +14,18 @@ import java.util.*;
 
 /**
  * Вебхук Prodamus:
- *  - endpoint: POST /webhook/prodamus
- *  - формат: application/x-www-form-urlencoded
- *  - подпись провайдера (опционально): см. PRODAMUS_SECRET. Если пуст — подпись не проверяем.
+ *  - POST /webhook/prodamus (application/x-www-form-urlencoded)
  *
- * Главное изменение:
- *  - поддержка надёжного связывания по order_num=swb:<uid>:<days>:<hmac>.
- *  - если order_num валиден — выдаём подписку и отправляем инвайт, даже если customer_extra пуст.
- *  - fallback: если order_num нет/битый, пробуем customer_extra + days.
+ * Логика:
+ *  1) Если есть валидный order_num=swb:<uid>:<days>:<hmac> — выдаём подписку по нему.
+ *  2) Иначе, если есть customer_extra (uid) — пытаемся определить days:
+ *      - по sum или products[0][price] (1299→30; 3599→90; 12900→365),
+ *      - либо по products[0][name] (ищем "1 мес", "3 мес", "12 мес" и формы «месяц/месяца/месяцев»).
+ *     Если days определён — выдаём подписку (fallback).
+ *
+ * Проверка подписи провайдера:
+ *  - гибкая, по "сырому телу" (hex/base64, допускаем "sha256=..."), можно отключить пустым PRODAMUS_SECRET.
+ *  - для продакшна рекомендую реализовать точный алгоритм 'Sign' Prodamus по набору полей.
  */
 public class ProdamusWebhookServer {
 
@@ -29,11 +33,13 @@ public class ProdamusWebhookServer {
 
     private final HttpServer server;
     private final SoulWayBot bot;
-    private final String secret;
+    private final String providerSecret; // PRODAMUS_SECRET
+    private final String linkSecret;     // BOT_LINK_SECRET — для верификации order_num
 
-    public ProdamusWebhookServer(SoulWayBot bot, int port, String secret) throws IOException {
+    public ProdamusWebhookServer(SoulWayBot bot, int port, String providerSecret) throws IOException {
         this.bot = bot;
-        this.secret = (secret == null) ? "" : secret.trim();
+        this.providerSecret = (providerSecret == null) ? "" : providerSecret.trim();
+        this.linkSecret = System.getenv().getOrDefault("BOT_LINK_SECRET", "");
         server = HttpServer.create(new InetSocketAddress(port), 0);
         server.createContext("/webhook/prodamus", new Handler());
         server.setExecutor(java.util.concurrent.Executors.newCachedThreadPool());
@@ -65,13 +71,12 @@ public class ProdamusWebhookServer {
                 LOG.info("[prodamus] incoming: ct='{}', sigPresent={}, rawLen={}",
                         shortCt(ctype), sigHeader != null, raw.length);
 
-                // NB: Проверку подписи провайдера здесь по-прежнему держим гибкой:
-                // если секрет пуст — не проверяем (для тестов/демо); если задан — проверяем ХMAC по raw (упрощённо).
-                if (!secret.isBlank()) {
-                    if (!verifySignatureFlexible(raw, sigHeader, secret)) {
+                // Подпись провайдера — мягкая проверка
+                if (!providerSecret.isBlank()) {
+                    if (!verifySignatureFlexible(raw, sigHeader, providerSecret)) {
                         Map<String,Object> flatSan = parseForm(new String(raw, StandardCharsets.UTF_8));
                         LOG.warn("[prodamus] provider signature mismatch; flatSan={}", toFlat(flatSan));
-                        respond(ex, 200, "ok (ignored)"); // отвечаем 200, чтобы провайдер не ретраил, но сами игнорируем
+                        respond(ex, 200, "ok (ignored)");
                         return;
                     }
                 } else {
@@ -81,22 +86,23 @@ public class ProdamusWebhookServer {
                 String body = new String(raw, StandardCharsets.UTF_8);
                 Map<String, Object> form = parseForm(body);
 
-                String orderNum = getString(form, "order_num");        // наш токен swb:<uid>:<days>:<hmac>
-                String custExtra = getString(form, "customer_extra");  // может быть пустым
-                String daysStr   = getString(form, "days");            // если прокинули
-                String status    = getString(form, "payment_status");  // success / failed ...
-                if (status == null) status = getString(form, "status"); // на всякий случай
+                String status      = or(getString(form, "payment_status"), getString(form, "status"));
+                String orderNum    = getString(form, "order_num");
+                String custExtra   = getString(form, "customer_extra");
+                String sumStr      = getString(form, "sum");
+                String prodPrice0  = getString(form, "products[0][price]");
+                String prodName0   = getString(form, "products[0][name]");
 
-                LOG.info("[prodamus] parsed: order_num='{}', customer_extra='{}', days='{}', status='{}'",
-                        safe(orderNum), safe(custExtra), safe(daysStr), safe(status));
+                LOG.info("[prodamus] parsed: order_num='{}', customer_extra='{}', sum='{}', price0='{}', name0='{}', status='{}'",
+                        safe(orderNum), safe(custExtra), safe(sumStr), safe(prodPrice0), safe(prodName0), safe(status));
 
                 if (!"success".equalsIgnoreCase(safe(status))) {
                     respond(ex, 200, "ok (ignored)");
                     return;
                 }
 
-                // 1) Пробуем наш надёжный токен order_num
-                long[] parsed = SoulWayBot.parseOrderNumToken(orderNum, System.getenv().getOrDefault("BOT_LINK_SECRET", ""));
+                // 1) Основной путь: order_num=swb:<uid>:<days>:<hmac>
+                long[] parsed = SoulWayBot.parseOrderNumToken(orderNum, linkSecret);
                 if (parsed != null) {
                     long uid = parsed[0];
                     int  days = (int) parsed[1];
@@ -104,28 +110,41 @@ public class ProdamusWebhookServer {
                         bot.onProdamusPaid(uid, days);
                         respond(ex, 200, "ok");
                     } catch (Exception e) {
-                        LOG.error("onProdamusPaid failed (order_num)", e);
+                        LOG.error("onProdamusPaid failed (order_num path)", e);
                         respond(ex, 500, "internal error");
                     }
                     LOG.info("[prodamus] handled in {} ms (order_num path)", (System.currentTimeMillis() - t0));
                     return;
                 }
 
-                // 2) Fallback: customer_extra + days
+                // 2) Fallback: customer_extra (+ определяем days по сумме/названию товара)
                 long uid = parseLong(custExtra, -1);
-                int  days = (int) parseLong(daysStr, 0);
-                if (uid > 0 && days > 0) {
-                    try {
-                        bot.onProdamusPaid(uid, days);
-                        respond(ex, 200, "ok");
-                    } catch (Exception e) {
-                        LOG.error("onProdamusPaid failed (customer_extra)", e);
-                        respond(ex, 500, "internal error");
+                if (uid > 0) {
+                    Integer days = null;
+                    days = (days != null) ? days : mapPriceToDays(sumStr);
+                    days = (days != null) ? days : mapPriceToDays(prodPrice0);
+                    days = (days != null) ? days : mapNameToDays(prodName0);
+
+                    if (days != null && days > 0) {
+                        try {
+                            bot.onProdamusPaid(uid, days);
+                            respond(ex, 200, "ok");
+                        } catch (Exception e) {
+                            LOG.error("onProdamusPaid failed (fallback path)", e);
+                            respond(ex, 500, "internal error");
+                        }
+                        LOG.info("[prodamus] handled in {} ms (fallback uid={}, days={})",
+                                (System.currentTimeMillis() - t0), uid, days);
+                        return;
+                    } else {
+                        LOG.warn("[prodamus] fallback could not determine days (uid present). form={}", toFlat(form));
+                        respond(ex, 200, "ok (ignored)");
+                        return;
                     }
-                } else {
-                    LOG.warn("[prodamus] insufficient data to grant sub; flat={}", toFlat(form));
-                    respond(ex, 200, "ok (ignored)");
                 }
+
+                LOG.warn("[prodamus] insufficient data to grant sub; flat={}", toFlat(form));
+                respond(ex, 200, "ok (ignored)");
 
             } catch (Exception e) {
                 LOG.error("webhook error", e);
@@ -136,8 +155,46 @@ public class ProdamusWebhookServer {
         }
     }
 
-    // ===== helpers =====
+    // ===== Определение days по цене/названию =====
+    private Integer mapPriceToDays(String priceStr) {
+        int price = parseInt(priceStr, -1);
+        if (price <= 0) return null;
+        if (price == 1299)  return 30;
+        if (price == 3599)  return 90;
+        if (price == 12900) return 365;
+        return null;
+    }
 
+    private Integer mapNameToDays(String name) {
+        if (name == null) return null;
+        String n = name.toLowerCase(Locale.ROOT);
+        if (n.contains("1 мес"))  return 30;
+        if (n.contains("3 мес"))  return 90;
+        if (n.contains("12 мес")) return 365;
+
+        int months = extractMonths(n);
+        if (months == 1)  return 30;
+        if (months == 3)  return 90;
+        if (months == 12) return 365;
+        return null;
+    }
+
+    private int extractMonths(String n) {
+        try {
+            int idx = n.indexOf("мес");
+            if (idx > 0) {
+                int i = idx - 1;
+                while (i >= 0 && Character.isWhitespace(n.charAt(i))) i--;
+                int end = i + 1;
+                while (i >= 0 && Character.isDigit(n.charAt(i))) i--;
+                int start = i + 1;
+                if (start < end) return Integer.parseInt(n.substring(start, end));
+            }
+        } catch (Exception ignore) {}
+        return -1;
+    }
+
+    // ===== helpers =====
     private static boolean verifySignatureFlexible(byte[] rawBody, String signature, String secret) {
         if (signature == null || signature.isBlank()) return false;
         String sig = signature.trim();
@@ -145,15 +202,9 @@ public class ProdamusWebhookServer {
             byte[] calc = hmacSha256(rawBody, secret.getBytes(StandardCharsets.UTF_8));
             String hex = toHex(calc);
             String b64 = Base64.getEncoder().encodeToString(calc);
-
-            String sigStr = sig;
-            if (sigStr.toLowerCase(Locale.ROOT).startsWith("sha256=")) {
-                sigStr = sigStr.substring("sha256=".length()).trim();
-            }
-            return constantTimeEquals(hex, sigStr) || constantTimeEquals(b64, sigStr);
-        } catch (Exception e) {
-            return false;
-        }
+            String s = sig.toLowerCase(Locale.ROOT).startsWith("sha256=") ? sig.substring(7).trim() : sig;
+            return constantTimeEquals(hex, s) || constantTimeEquals(b64, s);
+        } catch (Exception e) { return false; }
     }
 
     private static byte[] hmacSha256(byte[] data, byte[] key) throws Exception {
@@ -210,6 +261,9 @@ public class ProdamusWebhookServer {
     private static long parseLong(String s, long def) {
         try { return Long.parseLong(s.trim()); } catch (Exception e) { return def; }
     }
+    private static int parseInt(String s, int def) {
+        try { return Integer.parseInt(s.trim()); } catch (Exception e) { return def; }
+    }
 
     private static byte[] readAll(InputStream in) throws IOException {
         ByteArrayOutputStream bos = new ByteArrayOutputStream();
@@ -232,7 +286,6 @@ public class ProdamusWebhookServer {
         return map.toString();
     }
 
-    private static String safe(String s) {
-        return s == null ? "" : s;
-    }
+    private static String or(String a, String b) { return a != null ? a : b; }
+    private static String safe(String s) { return s == null ? "" : s; }
 }
