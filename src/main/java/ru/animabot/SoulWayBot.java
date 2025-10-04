@@ -7,14 +7,13 @@ import org.telegram.telegrambots.meta.api.methods.AnswerCallbackQuery;
 import org.telegram.telegrambots.meta.api.methods.BotApiMethod;
 import org.telegram.telegrambots.meta.api.methods.groupadministration.BanChatMember;
 import org.telegram.telegrambots.meta.api.methods.groupadministration.CreateChatInviteLink;
+import org.telegram.telegrambots.meta.api.methods.groupadministration.GetChatMember;
 import org.telegram.telegrambots.meta.api.methods.send.SendDocument;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
 import org.telegram.telegrambots.meta.api.methods.send.SendPhoto;
 import org.telegram.telegrambots.meta.api.methods.send.SendVideo;
-import org.telegram.telegrambots.meta.api.objects.CallbackQuery;
-import org.telegram.telegrambots.meta.api.objects.ChatInviteLink;
-import org.telegram.telegrambots.meta.api.objects.Message;
-import org.telegram.telegrambots.meta.api.objects.Update;
+import org.telegram.telegrambots.meta.api.objects.*;
+import org.telegram.telegrambots.meta.api.objects.chatmember.ChatMember;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.InlineKeyboardMarkup;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.InlineKeyboardButton;
 import org.telegram.telegrambots.meta.api.objects.InputFile;
@@ -86,13 +85,59 @@ public class SoulWayBot extends TelegramLongPollingBot {
     private static final String CB_MENU_PROCV  = "MENU:PROCVETA";
     private static final String CB_MENU_BACK   = "MENU:BACK";
 
+    // ===== Тексты drip-рассылки =====
+    private static final String DRIP_DAY1 =
+            "Всю свою осознанную жизнь я страдала…\n\n" +
+                    "Что я имею ввиду, когда происходили классные события, да, я за них благодарила, но не принимала, думала что не достойна, иногда обесценивала.\n\n" +
+                    "Например, я полетела в Доминикану, красота… море, пляж, все как на сказочной картинке, и вот я помню, захожу в теплый океан, солнце не жарит, так как есть облачка, пальмы вокруг, одним словом - счастье и внутренне умиротворение…\n\n" +
+                    "Что случилось потом?\nЯ подумала, что так нельзя, нельзя, чтобы было так хорошо, некомфортно когда хорошо, представляете?\n\n" +
+                    "И все, исполнено!\n\nЯ заболела, плюс на Доминикану тогда надвигался ураган, передавали по всем новостям, что снесет все отели… я оставшиеся дни, в стрессе просто хотела улететь домой (благодарю до сих пор, что за день до урагана у меня случился вылет), но сам факт того, что внутренне мне стало комфортнее быть в стрессе, чем в спокойствии.\n\n" +
+                    "Так вот что хочу сказать, страдать мы умеем, выживать - мы умеем, а находится в гармоничном состоянии - этому надо учится.\n\n" +
+                    "И выбор за вами - хотите вы страдать или нет.\n\n" +
+                    "Начать надо с того, чтобы осознать и сделать выбор - чего вы хотите на самом деле, признаться себе.\n\n" +
+                    "А в закрытом клубе я даю поддерживающее поле, где происходит изменения на многих уровнях… меняется мышление, окружение и усиливается связь со своей ДУШОЙ.\n\n" +
+                    "PS Могу сказать, что в гармоничном состоянии жить намного приятнее, чувствовать вкус жизни радостным и ярким - этому можно научится.\n\n" +
+                    "Приглашаю!\n\n*По дополнительным вопросам: @soulwaycare.";
+
+    private static final String DRIP_DAY3 =
+            "Вспомни фразу, как встретишь Новый год, так его и проведешь.\n\n" +
+                    "Так можно сказать про день - как встретишь, так и проведешь…\n\n" +
+                    "И это правда, настрой на день закладывает все события дня.\n\n" +
+                    "В закрытом клубе уже доступны медитации для гармоничного начала дня:\n\n" +
+                    "«Настрой на прекрасный день» - для создания вокруг себя пространства любви\n" +
+                    "«Энергетическая защита» - для создания защитного кокона, чтобы уберечь свое настроение и состояние от недоброжелателей\n" +
+                    "«Состояние изобилия» - эта практика хороша как утром, так и в течении дня в любое время\n\n" +
+                    "Присоединяйся!\n\n*По дополнительным вопросам: @soulwaycare.";
+
+    private static final String DRIP_DAY7 =
+            "Почему у одних все получается, а у других постоянно «не сейчас»?\n\n" +
+                    "Ведь и мотивация есть, и желание, в чем подвох?\n\n" +
+                    "Порой дело в твоем окружении, в какой среде ты находишься.\n\n" +
+                    "Представь себе красивый цветок, розу… и ты ее можешь поливать, пересаживать в кашпо, покупать удобрения, но вокруг - холод, темно, и нет солнца - она не зацветет…\n\n" +
+                    "Так происходит и с нами.\n\n" +
+                    "Если ты умная, красивая, у тебя есть вдохновение и мотивация, но рядом лишь те, кто не верит и обесценивает, то шанс на успех крайне мал.\n\n" +
+                    "Проверила на себе, знаю о чем говорю… \nХочешь действительно расцвести?\nНужно найти свою «теплицу»\n\n" +
+                    "Клуб Путь Души - это больше, чем клуб\n\n" +
+                    "Здесь есть все для того, чтобы вырасти:\n\n" +
+                    "Мощные практики - для ресурсного состояния и нового мышления\n" +
+                    "Совместные медитации - активации потенциала\n" +
+                    "Окружение - где понимают тебя и поддерживают\n\n" +
+                    "И если ты давно в поиске такого общения - сегодня идеальный момент.\n\n" +
+                    "Присоединяйся!\n\n*По дополнительным вопросам: @soulwaycare.";
+
     public SoulWayBot() {
         db = new SQLiteManager("soulway.db");
         df.setTimeZone(TimeZone.getTimeZone("Europe/Moscow"));
         seedDefaults();
+
+        // Периодическая чистка и рассылка
         scheduler.scheduleAtFixedRate(() -> {
             try { cleanupExpired(); } catch (Exception e) { LOG.warn("cleanup error", e); }
         }, 30, 30, TimeUnit.MINUTES);
+
+        scheduler.scheduleAtFixedRate(() -> {
+            try { processDripCampaigns(); } catch (Exception e) { LOG.warn("drip error", e); }
+        }, 1, 10, TimeUnit.MINUTES);
     }
 
     public SQLiteManager getDb() { return db; }
@@ -138,9 +183,16 @@ public class SoulWayBot extends TelegramLongPollingBot {
 
     private void seedDefaults() {
         putIfEmpty(S_WELCOME_TEXT,
-                "👋 Приветствую тебя, {name}!\n\n" +
-                        "✨ Хочешь получить подарок?\n" +
-                        "Тогда жми на кнопку ниже и забирай 🎁");
+                "{name}, Добро пожаловать!\n" +
+                        "Получи свой подарок, нажав на кодовое слово ниже, а Видео\n\n" +
+                        "Dmitry, приветствую тебя!\n" +
+                        "Меня зовут Анна Сибирская.\n" +
+                        "Приглашаю тебя в закрытый клуб Путь души | Soul Way.\n\n" +
+                        "Я создала это пространство для глубокого погружения и слияния со своей Душой, для раскрытия своей силы, потенциалов и новых возможностей ✨\n\n" +
+                        "Хочешь почувствовать вкус жизни, энергию, вдохновение?\n\n" +
+                        "Присоединяйся ❤️\n\n" +
+                        "Посмотреть наполнение клуба можно по кнопке «О Клубе» ниже⤵️\n\n" +
+                        "По вопросам: @SoulWayCare");
         putIfEmpty(S_GIFT_KEYWORD, "СВОБОДА");
 
         putIfEmpty(S_CLUB_TEXT,
@@ -207,16 +259,8 @@ public class SoulWayBot extends TelegramLongPollingBot {
         try {
             if (text.startsWith("/")) { handleCommand(msg, text); return; }
 
-            if (!text.isEmpty()) {
-                Keyword kw = db.findKeywordByKey(text);
-                if (kw != null) {
-                    SendMessage sm = new SendMessage(String.valueOf(chatId), nonEmpty(kw.getIntroText(), "🎁 Подарок:"));
-                    sm.setReplyMarkup(buildIntroKeyboard(kw));
-                    safeExec(sm);
-                } else {
-                    sendText(chatId, "❌ Кодовое слово не найдено. Проверьте написание или обратитесь к администратору.");
-                }
-            }
+            // Убрали ввод кодового слова с клавиатуры:
+            sendText(chatId, "Ой, кажется я не знаю такой команды, напишите /help если вам нужна помощь.");
         } catch (Exception e) {
             LOG.error("handleMessage error", e);
         }
@@ -232,12 +276,25 @@ public class SoulWayBot extends TelegramLongPollingBot {
         try {
             switch (cmd) {
                 case "/start": {
-                    String raw = db.getSetting(S_WELCOME_TEXT,
-                            "👋 Приветствую тебя, {name}!\n\n✨ Хочешь получить подарок?\nТогда жми на кнопку ниже и забирай 🎁");
+                    String raw = db.getSetting(S_WELCOME_TEXT, "{name}, Добро пожаловать!");
                     String name = msg.getFrom().getFirstName() != null ? msg.getFrom().getFirstName() : "друг";
                     SendMessage sm = new SendMessage(String.valueOf(chatId), raw.replace("{name}", name));
                     sm.setReplyMarkup(buildStartGiftKeyboard());
                     safeExec(sm);
+                    break;
+                }
+                case "/menu": {
+                    String firstName = msg.getFrom().getFirstName() != null ? msg.getFrom().getFirstName() : "друг";
+                    sendWelcomeWithMenu(chatId, firstName);
+                    break;
+                }
+                case "/help": {
+                    String help =
+                            "Доступные команды:\n" +
+                                    "• /start — приветствие и подарок\n" +
+                                    "• /menu — главное меню\n" +
+                                    "• /help — список команд\n";
+                    sendText(chatId, help);
                     break;
                 }
                 case "/setgift": {
@@ -340,7 +397,7 @@ public class SoulWayBot extends TelegramLongPollingBot {
                     break;
                 }
 
-                default: sendText(chatId, "Неизвестная команда.");
+                default: sendText(chatId, "Ой, кажется я не знаю такой команды, напишите /help если вам нужна помощь.");
             }
         } catch (Exception e) {
             LOG.error("handleCommand error", e);
@@ -361,10 +418,33 @@ public class SoulWayBot extends TelegramLongPollingBot {
                 String key = data.substring(CB_CHECKSUB_PREFIX.length());
                 Keyword kw = db.findKeywordByKey(key);
                 if (kw == null) { answerCallback(cb.getId(), "Кодовое слово не найдено."); return; }
-                answerCallback(cb.getId(), "✅ Подписка подтверждена!");
+
+                // Проверяем подписку на канал
+                boolean subscribed = isSubscribedToChannel(uid);
+                if (!subscribed) {
+                    // Сообщаем и снова показываем кнопки
+                    sendText(chatId, "Ой, кажется вы не подписаны на @"+CHANNEL_ID+". Подпишитесь и попробуйте еще раз.");
+                    SendMessage sm = new SendMessage(String.valueOf(chatId), nonEmpty(kw.getIntroText(), "🎁 Подарок:"));
+                    sm.setReplyMarkup(buildIntroKeyboard(kw));
+                    safeExec(sm);
+                    answerCallback(cb.getId(), "");
+                    return;
+                }
+
+                // Всё ок — выдаём бонус
+                answerCallback(cb.getId(), "✅ Подписка на канал подтверждена!");
                 sendReward(chatId, kw);
+
+                // После бонуса показываем меню
                 String firstName = cb.getFrom().getFirstName() != null ? cb.getFrom().getFirstName() : "друг";
                 sendWelcomeWithMenu(chatId, firstName);
+
+                // Если платной подписки нет — запускаем drip-рассылку (1,3,7 день)
+                Long exp = db.getSubscriptionExpiry(uid);
+                if (exp == null || exp <= System.currentTimeMillis()) {
+                    db.startOrResetDrip(uid, System.currentTimeMillis() + TimeUnit.DAYS.toMillis(1), 0);
+                }
+
                 return;
             }
 
@@ -424,6 +504,7 @@ public class SoulWayBot extends TelegramLongPollingBot {
                     break;
                 }
                 case CB_MENU_BACK: {
+                    // «Вернуться в начальное меню» — эквивалент /menu
                     String firstName = cb.getFrom().getFirstName() != null ? cb.getFrom().getFirstName() : "друг";
                     sendWelcomeWithMenu(chatId, firstName);
                     answerCallback(cb.getId(), "");
@@ -577,10 +658,28 @@ public class SoulWayBot extends TelegramLongPollingBot {
         return link;
     }
 
+    /** ТЕСТ: ссылка на 5 минут (без токена, по названию TEST-5M, обрабатывается в вебхуке). */
+    public String buildTest5MinLink(long uid) {
+        String base = db.getSetting(S_TAR1_URL, "https://soulway.payform.ru/4e9isVQ/");
+        Map<String, String> p = new LinkedHashMap<>();
+        p.put("do", "pay");
+        p.put("customer_extra", String.valueOf(uid));
+        p.put("products[0][price]", "1"); // символическая цена (можно 0, если провайдер позволяет)
+        p.put("products[0][quantity]", "1");
+        p.put("products[0][name]", "TEST-5M");
+        p.put("sum", "1");
+        return appendParamsRawKeys(base, p);
+    }
+
+    // ИСПРАВЛЕНО: корректно брать цену из конца лейбла («1 МЕС • 1299 ₽» → 1299)
     private static int extractPriceRub(String labelOrPrice, int def) {
         if (labelOrPrice == null) return def;
-        String s = labelOrPrice.replaceAll("[^0-9]", "");
-        try { return Integer.parseInt(s); } catch (Exception e) { return def; }
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("([0-9][0-9\\s.,]*)\\s*(?:₽|руб|RUB)?\\s*$", java.util.regex.Pattern.CASE_INSENSITIVE)
+                .matcher(labelOrPrice);
+        if (!m.find()) return def;
+        String num = m.group(1).replaceAll("[\\s.,]", "");
+        try { return Integer.parseInt(num); } catch (Exception e) { return def; }
     }
 
     private void sendTariffs(long chatId, long userId, boolean withBack) {
@@ -653,7 +752,23 @@ public class SoulWayBot extends TelegramLongPollingBot {
             } else {
                 sendText(uid, "Благодарю за оплату! ✨ Мы скоро пришлём ссылку для входа в чат.");
             }
+            // При оплате — отключаем drip-рассылку
+            db.deleteDrip(uid);
         } catch (Exception e) { LOG.error("onProdamusPaid error", e); }
+    }
+
+    public void onProdamusPaidMinutes(long uid, int minutes) {
+        try {
+            if (uid <= 0) return;
+            db.grantSubscriptionMinutes(uid, minutes);
+            String invite = ensureInviteLink();
+            if (invite != null) {
+                sendText(uid, "Тестовый доступ на " + minutes + " минут выдан. 🔗 Вход в чат:\n" + invite);
+            } else {
+                sendText(uid, "Тестовый доступ на " + minutes + " минут выдан.");
+            }
+            db.deleteDrip(uid); // тест доступ — тоже стопаем drip
+        } catch (Exception e) { LOG.error("onProdamusPaidMinutes error", e); }
     }
 
     // ===== Работа с группой =====
@@ -692,6 +807,54 @@ public class SoulWayBot extends TelegramLongPollingBot {
             } catch (Exception e) { LOG.warn("Не удалось удалить {}: {}", uid, e.getMessage()); }
         }
         return removed;
+    }
+
+    // ===== Drip-рассылка =====
+
+    private void processDripCampaigns() {
+        long now = System.currentTimeMillis();
+        List<SQLiteManager.Drip> due = db.listDueDrips(now, 100);
+        for (SQLiteManager.Drip d : due) {
+            try {
+                // Если подписка уже активна — удаляем кампанию и не шлём
+                Long exp = db.getSubscriptionExpiry(d.userId);
+                if (exp != null && exp > now) {
+                    db.deleteDrip(d.userId);
+                    continue;
+                }
+
+                String text;
+                switch (d.step) {
+                    case 0: text = DRIP_DAY1; break; // +1 день
+                    case 1: text = DRIP_DAY3; break; // +3 день
+                    default: text = DRIP_DAY7; break; // +7 день
+                }
+
+                SendMessage sm = new SendMessage(String.valueOf(d.userId), text);
+                InlineKeyboardMarkup kb = new InlineKeyboardMarkup();
+                kb.setKeyboard(List.of(List.of(btn("💳 ТАРИФЫ", CB_MENU_TARIFF))));
+                sm.setReplyMarkup(kb);
+                safeExec(sm);
+
+                // Переводим на следующий шаг/цикл
+                long next;
+                int nextStep;
+                if (d.step == 0) { // был +1 → следующий через +2 дня (итого 3)
+                    next = now + TimeUnit.DAYS.toMillis(2);
+                    nextStep = 1;
+                } else if (d.step == 1) { // был +3 → следующий через +4 дня (итого 7)
+                    next = now + TimeUnit.DAYS.toMillis(4);
+                    nextStep = 2;
+                } else { // был +7 → с нуля через +1 день
+                    next = now + TimeUnit.DAYS.toMillis(1);
+                    nextStep = 0;
+                }
+                db.updateDrip(d.userId, next, nextStep);
+                Thread.sleep(80);
+            } catch (Exception e) {
+                LOG.warn("drip send failed for {}: {}", d.userId, e.getMessage());
+            }
+        }
     }
 
     // ===== Награда по ключевому слову =====
@@ -803,6 +966,21 @@ public class SoulWayBot extends TelegramLongPollingBot {
         v = v.replace(" ", "%20").replace("(", "%28").replace(")", "%29")
                 .replace("[", "%5B").replace("]", "%5D").replace("{", "%7B").replace("}", "%7D");
         try { return new URI(v).toASCIIString(); } catch (Exception ignore) { return v; }
+    }
+
+    private boolean isSubscribedToChannel(long userId) {
+        try {
+            GetChatMember req = new GetChatMember();
+            req.setChatId("@" + CHANNEL_ID);
+            req.setUserId(userId);
+            ChatMember cm = execute(req);
+            if (cm == null) return false;
+            String status = cm.getStatus();
+            return !"left".equalsIgnoreCase(status) && !"kicked".equalsIgnoreCase(status);
+        } catch (Exception e) {
+            LOG.warn("getChatMember failed: {}", e.getMessage());
+            return false;
+        }
     }
 
     private static String nonEmpty(String s, String def) { return (s == null || s.isBlank()) ? def : s; }

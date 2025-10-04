@@ -82,6 +82,8 @@ public class ProdamusWebhookServer {
                 String sumStr      = doubleDecode(getString(form, "sum"));
                 String prodPrice0  = doubleDecode(getString(form, "products[0][price]"));
                 String prodName0   = doubleDecode(getString(form, "products[0][name]"));
+                String eventId     = or(doubleDecode(getString(form, "event_id")),
+                        or(orderId, orderNum)); // идемпотентность: используем что-то стабильное
 
                 LOG.info("[prodamus] parsed: order_id='{}', order_num='{}', customer_extra='{}', sum='{}', price0='{}', name0='{}', status='{}'",
                         safe(orderId), safe(orderNum), safe(custExtra), safe(sumStr), safe(prodPrice0), safe(prodName0), safe(status));
@@ -89,6 +91,16 @@ public class ProdamusWebhookServer {
                 if (!"success".equalsIgnoreCase(safe(status))) {
                     respond(ex, 200, "ok (ignored)");
                     return;
+                }
+
+                // ИДЕМПОТЕНТНОСТЬ: если уже обрабатывали — отвечаем ОК, но выходим.
+                if (eventId != null && !eventId.isBlank()) {
+                    boolean firstTime = bot.getDb().markWebhookProcessed("prodamus", eventId);
+                    if (!firstTime) {
+                        LOG.info("[prodamus] duplicate webhook ignored, eventId={}", eventId);
+                        respond(ex, 200, "ok (duplicate)");
+                        return;
+                    }
                 }
 
                 // 1) Пытаемся разобрать наш токен swb:<uid>:<days>:<hmac> (сначала order_num, потом order_id)
@@ -99,7 +111,17 @@ public class ProdamusWebhookServer {
                     long uid = parsed[0];
                     int  days = (int) parsed[1];
                     try {
-                        bot.onProdamusPaid(uid, days);
+                        if (days > 0) {
+                            bot.onProdamusPaid(uid, days);
+                        } else {
+                            // days==0 используем только для специальных тестовых продуктов (напр., TEST-5M)
+                            Integer minutes = mapNameToTestMinutes(prodName0);
+                            if (minutes != null && minutes > 0) {
+                                bot.onProdamusPaidMinutes(uid, minutes);
+                            } else {
+                                LOG.warn("[prodamus] token days=0 but name doesn't indicate test minutes");
+                            }
+                        }
                         respond(ex, 200, "ok");
                     } catch (Exception e) {
                         LOG.error("onProdamusPaid failed (token path)", e);
@@ -110,9 +132,24 @@ public class ProdamusWebhookServer {
                     return;
                 }
 
-                // 2) Fallback — если токена нет: берём uid из customer_extra и пытаемся вывести days по цене/именованию
+                // 2) Fallback — если токена нет: берём uid из customer_extra и пытаемся вывести срок
                 long uid = parseLong(custExtra, -1);
                 if (uid > 0) {
+                    // Тестовый продукт на 5 минут?
+                    Integer testMin = mapNameToTestMinutes(prodName0);
+                    if (testMin != null && testMin > 0) {
+                        try {
+                            bot.onProdamusPaidMinutes(uid, testMin);
+                            respond(ex, 200, "ok");
+                        } catch (Exception e) {
+                            LOG.error("onProdamusPaidMinutes failed (fallback path)", e);
+                            respond(ex, 500, "internal error");
+                        }
+                        LOG.info("[prodamus] handled in {} ms (fallback TEST-{}m uid={})",
+                                (System.currentTimeMillis() - t0), testMin, uid);
+                        return;
+                    }
+
                     Integer days = null;
                     days = (days != null) ? days : mapPriceToDays(sumStr);
                     days = (days != null) ? days : mapPriceToDays(prodPrice0);
@@ -168,7 +205,8 @@ public class ProdamusWebhookServer {
 
     // ==== Определение срока по цене/названию (fallback) ====
     private Integer mapPriceToDays(String priceStr) {
-        int price = parseInt(roundPrice(priceStr), -1);
+        String digits = roundPrice(priceStr);
+        int price = parseInt(digits, -1);
         if (price <= 0) return null;
         if (price == 1299)  return 30;
         if (price == 3599)  return 90;
@@ -177,7 +215,9 @@ public class ProdamusWebhookServer {
     }
     private String roundPrice(String s) {
         if (s == null) return null;
-        String digits = s.replaceAll("[^0-9]", "");
+        // допускаем форматы "3 599.00" → "3599"
+        String digits = s.replaceAll("[\\s.,]", "");
+        digits = digits.replaceAll("[^0-9]", "");
         return digits.isEmpty() ? null : digits;
     }
     private Integer mapNameToDays(String name) {
@@ -192,6 +232,14 @@ public class ProdamusWebhookServer {
         if (months == 12) return 365;
         return null;
     }
+    // Спец: распознаём тестовый продукт на 5 минут по названию
+    private Integer mapNameToTestMinutes(String name) {
+        if (name == null) return null;
+        String n = name.toUpperCase(Locale.ROOT);
+        if (n.contains("TEST-5M") || n.contains("TEST5M")) return 5;
+        return null;
+    }
+
     private int extractMonths(String n) {
         try {
             int idx = n.indexOf("мес");
@@ -234,12 +282,12 @@ public class ProdamusWebhookServer {
         return sb.toString();
     }
 
+    // ИСПРАВЛЕНО: корректное сравнение «за O(1)» по времени
     private static boolean constantTimeEquals(String a, String b) {
         if (a == null || b == null) return false;
-        if (a.length() != b.length()) return false;
-        int r = 0;
-        for (int i = 0; i < a.length(); i++) r |= a.charAt(i) ^ a.charAt(i);
-        return r == 0;
+        byte[] ab = a.getBytes(StandardCharsets.UTF_8);
+        byte[] bb = b.getBytes(StandardCharsets.UTF_8);
+        return java.security.MessageDigest.isEqual(ab, bb);
     }
 
     private static String firstNonEmpty(String... v) {

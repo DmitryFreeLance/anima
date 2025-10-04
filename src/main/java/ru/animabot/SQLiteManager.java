@@ -10,6 +10,7 @@ import java.util.*;
  *  - subscriptions (userId, expiresAtMillis)
  *  - orders (orderId, userId, plan, days, createdAtMillis, paidAtMillis)
  *  - processed_webhooks (provider, event_id) — идемпотентность
+ *  - drip_campaigns (userId, nextAtMillis, step)
  * Включены WAL/busy_timeout.
  */
 public class SQLiteManager {
@@ -76,6 +77,15 @@ public class SQLiteManager {
                         "event_id TEXT NOT NULL," +
                         "processed_at INTEGER NOT NULL," +
                         "PRIMARY KEY(provider, event_id)" +
+                        ");");
+            }
+
+            // Новая таблица для drip-кампаний
+            try (Statement st = conn.createStatement()) {
+                st.executeUpdate("CREATE TABLE IF NOT EXISTS drip_campaigns (" +
+                        "userId INTEGER PRIMARY KEY," +
+                        "nextAtMillis INTEGER NOT NULL," +
+                        "step INTEGER NOT NULL" +
                         ");");
             }
 
@@ -173,6 +183,24 @@ public class SQLiteManager {
     public void grantSubscription(long userId, int days) {
         long now = System.currentTimeMillis();
         long add = days * 24L * 60L * 60L * 1000L;
+        long newExp = now + add;
+        Long cur = getSubscriptionExpiry(userId);
+        if (cur != null && cur > now) newExp = cur + add;
+
+        String sql = "INSERT INTO subscriptions(userId, expiresAtMillis) VALUES(?,?) " +
+                "ON CONFLICT(userId) DO UPDATE SET expiresAtMillis=excluded.expiresAtMillis";
+        try (Connection conn = connect(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, userId);
+            ps.setLong(2, newExp);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public void grantSubscriptionMinutes(long userId, int minutes) {
+        long now = System.currentTimeMillis();
+        long add = minutes * 60L * 1000L;
         long newExp = now + add;
         Long cur = getSubscriptionExpiry(userId);
         if (cur != null && cur > now) newExp = cur + add;
@@ -291,6 +319,68 @@ public class SQLiteManager {
             e.printStackTrace();
             return false;
         }
+    }
+
+    // ===== drip-campaigns =====
+
+    public static class Drip {
+        public final long userId;
+        public final long nextAtMillis;
+        public final int step;
+        public Drip(long userId, long nextAtMillis, int step) {
+            this.userId = userId; this.nextAtMillis = nextAtMillis; this.step = step;
+        }
+    }
+
+    public void startOrResetDrip(long userId, long nextAtMillis, int step) {
+        String sql = "INSERT INTO drip_campaigns(userId, nextAtMillis, step) VALUES(?,?,?) " +
+                "ON CONFLICT(userId) DO UPDATE SET nextAtMillis=excluded.nextAtMillis, step=excluded.step";
+        try (Connection conn = connect(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, userId);
+            ps.setLong(2, nextAtMillis);
+            ps.setInt(3, step);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public void updateDrip(long userId, long nextAtMillis, int step) {
+        String sql = "UPDATE drip_campaigns SET nextAtMillis=?, step=? WHERE userId=?";
+        try (Connection conn = connect(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, nextAtMillis);
+            ps.setInt(2, step);
+            ps.setLong(3, userId);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public void deleteDrip(long userId) {
+        try (Connection conn = connect(); PreparedStatement ps = conn.prepareStatement("DELETE FROM drip_campaigns WHERE userId=?")) {
+            ps.setLong(1, userId);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public List<Drip> listDueDrips(long nowMillis, int limit) {
+        List<Drip> out = new ArrayList<>();
+        String sql = "SELECT userId, nextAtMillis, step FROM drip_campaigns WHERE nextAtMillis<=? ORDER BY nextAtMillis ASC LIMIT ?";
+        try (Connection conn = connect(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, nowMillis);
+            ps.setInt(2, limit);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    out.add(new Drip(rs.getLong("userId"), rs.getLong("nextAtMillis"), rs.getInt("step")));
+                }
+            }
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+        return out;
     }
 
     // ===== utils =====
