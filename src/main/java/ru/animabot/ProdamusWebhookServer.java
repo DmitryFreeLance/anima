@@ -18,8 +18,8 @@ public class ProdamusWebhookServer {
 
     private final HttpServer server;
     private final SoulWayBot bot;
-    private final String providerSecret;
-    private final String linkSecret;
+    private final String providerSecret; // секрет подписи провайдера (если есть)
+    private final String linkSecret;     // наш секрет для токена swb:<uid>:<days>:<hmac>
 
     public ProdamusWebhookServer(SoulWayBot bot, int port, String providerSecret) throws IOException {
         this.bot = bot;
@@ -65,7 +65,7 @@ public class ProdamusWebhookServer {
                             respond(ex, 200, "ok (ignored)");
                             return;
                         }
-                        // strict=0 — продолжаем обработку
+                        // strict=0 → продолжаем обработку
                     }
                 } else {
                     LOG.warn("[prodamus] PRODAMUS_SECRET is empty — provider signature check is DISABLED!");
@@ -74,23 +74,27 @@ public class ProdamusWebhookServer {
                 String body = new String(raw, StandardCharsets.UTF_8);
                 Map<String, Object> form = parseForm(body);
 
+                // Поля (двойная декодировка значений — часто приходят проценто-кодированные)
                 String status      = or(getString(form, "payment_status"), getString(form, "status"));
-                String orderId     = getString(form, "order_id");          // <= наш номер заказа (если передали)
-                String custExtra   = getString(form, "customer_extra");     // <= «Доп.данные»
-                String sumStr      = getString(form, "sum");
-                String prodPrice0  = getString(form, "products[0][price]");
-                String prodName0   = getString(form, "products[0][name]");
+                String orderId     = doubleDecode(getString(form, "order_id"));
+                String orderNum    = doubleDecode(getString(form, "order_num"));     // ← здесь обычно наш токен
+                String custExtra   = doubleDecode(getString(form, "customer_extra"));
+                String sumStr      = doubleDecode(getString(form, "sum"));
+                String prodPrice0  = doubleDecode(getString(form, "products[0][price]"));
+                String prodName0   = doubleDecode(getString(form, "products[0][name]"));
 
-                LOG.info("[prodamus] parsed: order_id='{}', customer_extra='{}', sum='{}', price0='{}', name0='{}', status='{}'",
-                        safe(orderId), safe(custExtra), safe(sumStr), safe(prodPrice0), safe(prodName0), safe(status));
+                LOG.info("[prodamus] parsed: order_id='{}', order_num='{}', customer_extra='{}', sum='{}', price0='{}', name0='{}', status='{}'",
+                        safe(orderId), safe(orderNum), safe(custExtra), safe(sumStr), safe(prodPrice0), safe(prodName0), safe(status));
 
                 if (!"success".equalsIgnoreCase(safe(status))) {
                     respond(ex, 200, "ok (ignored)");
                     return;
                 }
 
-                // 1) Основной путь — order_id=swb:<uid>:<days>:<h>
-                long[] parsed = SoulWayBot.parseOrderIdToken(orderId, linkSecret);
+                // 1) Пытаемся разобрать наш токен swb:<uid>:<days>:<hmac> (сначала order_num, потом order_id)
+                long[] parsed = tryParseOurToken(orderNum);
+                if (parsed == null) parsed = tryParseOurToken(orderId);
+
                 if (parsed != null) {
                     long uid = parsed[0];
                     int  days = (int) parsed[1];
@@ -98,14 +102,15 @@ public class ProdamusWebhookServer {
                         bot.onProdamusPaid(uid, days);
                         respond(ex, 200, "ok");
                     } catch (Exception e) {
-                        LOG.error("onProdamusPaid failed (order_id path)", e);
+                        LOG.error("onProdamusPaid failed (token path)", e);
                         respond(ex, 500, "internal error");
                     }
-                    LOG.info("[prodamus] handled in {} ms (order_id path)", (System.currentTimeMillis() - t0));
+                    LOG.info("[prodamus] handled in {} ms (token path uid={}, days={})",
+                            (System.currentTimeMillis() - t0), parsed[0], parsed[1]);
                     return;
                 }
 
-                // 2) Fallback — customer_extra + пытаемся понять days по цене/названию
+                // 2) Fallback — если токена нет: берём uid из customer_extra и пытаемся вывести days по цене/именованию
                 long uid = parseLong(custExtra, -1);
                 if (uid > 0) {
                     Integer days = null;
@@ -143,21 +148,44 @@ public class ProdamusWebhookServer {
         }
     }
 
-    // ==== Определение срока по цене/названию ====
+    // ==== Наш токен может лежать в order_num или order_id ====
+    private long[] tryParseOurToken(String v) {
+        if (v == null || v.isBlank()) return null;
+        return SoulWayBot.parseOrderIdToken(v.trim(), linkSecret);
+    }
+
+    // ==== Двойная URL-декодировка ====
+    private static String doubleDecode(String s) {
+        if (s == null) return null;
+        String once = urlDecodeSafe(s);
+        String twice = urlDecodeSafe(once);
+        return twice;
+    }
+    private static String urlDecodeSafe(String s) {
+        try { return URLDecoder.decode(s, StandardCharsets.UTF_8); }
+        catch (Exception e) { return s; }
+    }
+
+    // ==== Определение срока по цене/названию (fallback) ====
     private Integer mapPriceToDays(String priceStr) {
-        int price = parseInt(priceStr, -1);
+        int price = parseInt(roundPrice(priceStr), -1);
         if (price <= 0) return null;
         if (price == 1299)  return 30;
         if (price == 3599)  return 90;
         if (price == 12900) return 365;
         return null;
     }
+    private String roundPrice(String s) {
+        if (s == null) return null;
+        String digits = s.replaceAll("[^0-9]", "");
+        return digits.isEmpty() ? null : digits;
+    }
     private Integer mapNameToDays(String name) {
         if (name == null) return null;
         String n = name.toLowerCase(Locale.ROOT);
-        if (n.contains("1 мес"))  return 30;
-        if (n.contains("3 мес"))  return 90;
-        if (n.contains("12 мес")) return 365;
+        if (n.contains("1 месяц") || n.contains("1 мес"))  return 30;
+        if (n.contains("3 месяца") || n.contains("3 мес")) return 90;
+        if (n.contains("12 месяцев") || n.contains("12 мес")) return 365;
         int months = extractMonths(n);
         if (months == 1)  return 30;
         if (months == 3)  return 90;
@@ -167,6 +195,8 @@ public class ProdamusWebhookServer {
     private int extractMonths(String n) {
         try {
             int idx = n.indexOf("мес");
+            if (idx < 0) idx = n.indexOf("месяц");
+            if (idx < 0) idx = n.indexOf("месяцев");
             if (idx > 0) {
                 int i = idx - 1;
                 while (i >= 0 && Character.isWhitespace(n.charAt(i))) i--;
@@ -208,7 +238,7 @@ public class ProdamusWebhookServer {
         if (a == null || b == null) return false;
         if (a.length() != b.length()) return false;
         int r = 0;
-        for (int i = 0; i < a.length(); i++) r |= a.charAt(i) ^ b.charAt(i);
+        for (int i = 0; i < a.length(); i++) r |= a.charAt(i) ^ a.charAt(i);
         return r == 0;
     }
 
