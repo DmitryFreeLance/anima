@@ -7,15 +7,8 @@ import org.telegram.telegrambots.meta.api.methods.AnswerCallbackQuery;
 import org.telegram.telegrambots.meta.api.methods.BotApiMethod;
 import org.telegram.telegrambots.meta.api.methods.groupadministration.BanChatMember;
 import org.telegram.telegrambots.meta.api.methods.groupadministration.CreateChatInviteLink;
-import org.telegram.telegrambots.meta.api.methods.send.SendDocument;
-import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
-import org.telegram.telegrambots.meta.api.methods.send.SendPhoto;
-import org.telegram.telegrambots.meta.api.methods.send.SendVideo;
-import org.telegram.telegrambots.meta.api.objects.CallbackQuery;
-import org.telegram.telegrambots.meta.api.objects.ChatInviteLink;
-import org.telegram.telegrambots.meta.api.objects.Message;
-import org.telegram.telegrambots.meta.api.objects.Update;
-import org.telegram.telegrambots.meta.api.objects.InputFile;
+import org.telegram.telegrambots.meta.api.methods.send.*;
+import org.telegram.telegrambots.meta.api.objects.*;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.InlineKeyboardMarkup;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.InlineKeyboardButton;
 
@@ -27,18 +20,11 @@ import java.text.SimpleDateFormat;
 import java.util.*;
 import java.util.concurrent.*;
 
-/**
- * SoulWayBot:
- *  - /start: приветствие + кнопка «🎁 <КОДОВОЕ СЛОВО>».
- *  - «Тарифы»: формирует ссылку оплаты на ПОДДОМЕНЕ Prodamus с параметрами из их документации:
- *      do=pay&order_num=swb:<uid>:<days>:<h>&customer_extra=<uid>&products[0][price]=...&products[0][quantity]=1&products[0][name]=...
- *  - Webhook выдаёт подписку по order_num (если пришёл) либо по customer_extra + сумме/названию товара (fallback).
- */
 public class SoulWayBot extends TelegramLongPollingBot {
 
     private static final Logger LOG = LoggerFactory.getLogger(SoulWayBot.class);
 
-    // ===== Настройки (ключи в БД) =====
+    // ==== Ключи настроек ====
     private static final String S_WELCOME_TEXT     = "welcome_text";
     private static final String S_WELCOME_VIDEO    = "welcome_video";
     private static final String S_CLUB_TEXT        = "club_text";
@@ -52,7 +38,7 @@ public class SoulWayBot extends TelegramLongPollingBot {
 
     private static final String S_TAR1_LABEL = "tariff1_label";
     private static final String S_TAR1_DAYS  = "tariff1_days";
-    private static final String S_TAR1_URL   = "tariff1_url";   // БАЗОВЫЙ URL формы (поддомен)
+    private static final String S_TAR1_URL   = "tariff1_url";   // ДОЛЖЕН быть https://<поддомен>.payform.ru/
 
     private static final String S_TAR2_LABEL = "tariff2_label";
     private static final String S_TAR2_DAYS  = "tariff2_days";
@@ -66,23 +52,20 @@ public class SoulWayBot extends TelegramLongPollingBot {
     private static final String S_GROUP_INVITE_URL = "group_invite_url";
     private static final String S_GIFT_KEYWORD     = "gift_keyword";
 
-    // ===== ENV =====
+    // ==== ENV ====
     private final String BOT_TOKEN    = System.getenv().getOrDefault("TG_BOT_TOKEN", "YOUR_TOKEN");
     private final String BOT_USERNAME = System.getenv().getOrDefault("TG_BOT_USERNAME", "SoulWayClub_bot");
     private final long   ADMIN_ID     = Long.parseLong(System.getenv().getOrDefault("TG_ADMIN_ID", "726773708"));
     private final String CHANNEL_ID   = System.getenv().getOrDefault("TG_CHANNEL_ID", "sibirskaiapro"); // без @
-
-    /** Секрет для подписи наших order_num. */
     private final String BOT_LINK_SECRET = System.getenv().getOrDefault("BOT_LINK_SECRET", "");
 
-    /** Корень для локальных материалов. */
     private static final String FILES_ROOT = "/work/files/";
 
     private final SQLiteManager db;
     private final SimpleDateFormat df = new SimpleDateFormat("dd.MM.yyyy HH:mm");
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
 
-    // ===== Callback константы =====
+    // ==== Callbacks ====
     private static final String CB_CHECKSUB_PREFIX = "CHECKSUB:";
     private static final String CB_OPENKW_PREFIX   = "OPENKW:";
     private static final String CB_MENU_CLUB   = "MENU:CLUB";
@@ -98,7 +81,6 @@ public class SoulWayBot extends TelegramLongPollingBot {
         db = new SQLiteManager("soulway.db");
         df.setTimeZone(TimeZone.getTimeZone("Europe/Moscow"));
         seedDefaults();
-
         scheduler.scheduleAtFixedRate(() -> {
             try { cleanupExpired(); } catch (Exception e) { LOG.warn("cleanup error", e); }
         }, 30, 30, TimeUnit.MINUTES);
@@ -106,7 +88,7 @@ public class SoulWayBot extends TelegramLongPollingBot {
 
     public SQLiteManager getDb() { return db; }
 
-    // ===== crypto для order_num =====
+    // ==== HMAC для маркера в order_id ====
     public static String hmacHex(String data, String secret) {
         try {
             if (secret == null || secret.isBlank()) return "0";
@@ -120,13 +102,13 @@ public class SoulWayBot extends TelegramLongPollingBot {
     }
 
     /** swb:<uid>:<days>:<hmac(uid:days)> */
-    private String buildOrderNumToken(long uid, int days) {
+    private String buildOrderIdToken(long uid, int days) {
         String payload = uid + ":" + days;
         return "swb:" + payload + ":" + hmacHex(payload, BOT_LINK_SECRET);
     }
 
-    /** Разбор нашего order_num. null — если подпись не сходится. */
-    public static long[] parseOrderNumToken(String token, String secret) {
+    /** Разбор нашего order_id. null — если подпись не сходится. */
+    public static long[] parseOrderIdToken(String token, String secret) {
         if (token == null) return null;
         token = token.trim();
         if (!token.startsWith("swb:")) return null;
@@ -140,7 +122,6 @@ public class SoulWayBot extends TelegramLongPollingBot {
         } catch (Exception ignore) { return null; }
     }
 
-    // ===== дефолтные настройки =====
     private void seedDefaults() {
         putIfEmpty(S_WELCOME_TEXT,
                 "👋 Приветствую тебя, {name}!\n\n" +
@@ -168,7 +149,7 @@ public class SoulWayBot extends TelegramLongPollingBot {
         putIfEmpty(S_PROCVETA_TEXT,"🌸 КЛУБ «ПРОЦВЕТАЙ»\nКлуб с живыми встречами в Санкт-Петербурге ❤️");
         putIfEmpty(S_PROCVETA_URL, "https://t.me/procvetaiclub");
 
-        // ВАЖНО: для стабильной передачи параметров — базовый URL должен быть ПОДДОМЕНОМ формы!
+        // ВАЖНО: ссылка — на ПОДДОМЕН формы (не короткая payform.ru/xxxx/)
         putIfEmpty(S_TAR1_LABEL, "1 МЕС • 1299 ₽");
         putIfEmpty(S_TAR1_DAYS,  "30");
         putIfEmpty(S_TAR1_URL,   "https://soulway.payform.ru/");
@@ -190,7 +171,6 @@ public class SoulWayBot extends TelegramLongPollingBot {
     @Override public String getBotUsername() { return BOT_USERNAME; }
     @Override public String getBotToken() { return BOT_TOKEN; }
 
-    // ===== Updates =====
     @Override
     public void onUpdateReceived(Update update) {
         try {
@@ -202,7 +182,6 @@ public class SoulWayBot extends TelegramLongPollingBot {
         }
     }
 
-    // ===== Messages =====
     private void handleMessage(Message msg) {
         if (msg == null || msg.getFrom() == null) return;
         long chatId = msg.getChatId();
@@ -228,7 +207,6 @@ public class SoulWayBot extends TelegramLongPollingBot {
         }
     }
 
-    // ===== Commands =====
     private void handleCommand(Message msg, String text) {
         long chatId = msg.getChatId();
         long userId = msg.getFrom().getId();
@@ -251,7 +229,7 @@ public class SoulWayBot extends TelegramLongPollingBot {
                     if (!isAdmin(userId)) { deny(chatId); break; }
                     if (args.isBlank()) { sendText(chatId, "Формат: /setgift <KEYWORD>"); break; }
                     db.setSetting(S_GIFT_KEYWORD, args.trim().toUpperCase(Locale.ROOT));
-                    sendText(chatId, "✅ Кодовое слово подарка обновлено: " + args.trim().toUpperCase(Locale.ROOT));
+                    sendText(chatId, "✅ Кодовое слово обновлено: " + args.trim().toUpperCase(Locale.ROOT));
                     break;
                 }
                 case "/addkw": {
@@ -261,12 +239,9 @@ public class SoulWayBot extends TelegramLongPollingBot {
                     if (p.length < 3) { sendText(chatId, "Нужно минимум KEY|INTRO|REWARD"); break; }
                     Keyword kw = new Keyword(
                             safeTrim(p[0]).toUpperCase(Locale.ROOT),
-                            safeTrim(p[1]),
-                            safeTrim(p[2]),
+                            safeTrim(p[1]), safeTrim(p[2]),
                             (p.length == 4 && p[3] != null && !p[3].isBlank())
-                                    ? Arrays.asList(p[3].split(","))
-                                    : Collections.emptyList()
-                    );
+                                    ? Arrays.asList(p[3].split(",")) : Collections.emptyList());
                     db.upsertKeyword(kw);
                     sendText(chatId, "✅ Добавлено/обновлено слово: " + kw.getKeyword());
                     break;
@@ -283,7 +258,7 @@ public class SoulWayBot extends TelegramLongPollingBot {
                     break;
                 }
 
-                // Редактируемые тексты
+                // Редактируемые тексты/ссылки
                 case "/setwelcome":       if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_WELCOME_TEXT, args); sendText(chatId, "✅ Приветственный текст обновлён."); break;
                 case "/setwelcomevideo":  if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_WELCOME_VIDEO, args); sendText(chatId, "✅ Видео приветствия обновлено."); break;
                 case "/setclub":          if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_CLUB_TEXT, args);     sendText(chatId, "✅ «О клубе» обновлён."); break;
@@ -295,7 +270,7 @@ public class SoulWayBot extends TelegramLongPollingBot {
                 case "/setprocveta":      if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_PROCVETA_URL, args);  sendText(chatId, "✅ Ссылка «Процветай» обновлена."); break;
                 case "/setprocveta_text": if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_PROCVETA_TEXT, args); sendText(chatId, "✅ Текст «Процветай» обновлён."); break;
 
-                // Тарифы
+                // Тарифы (LABEL|DAYS|BASE_URL)
                 case "/settariff1": {
                     if (!isAdmin(userId)) { deny(chatId); break; }
                     String[] a = args.split("\\|", 3);
@@ -327,7 +302,7 @@ public class SoulWayBot extends TelegramLongPollingBot {
                     break;
                 }
 
-                // Группа / Сервис
+                // Группа / сервисное
                 case "/setgroup":     if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_GROUP_ID, args.trim());         sendText(chatId, "✅ ID группы сохранён."); break;
                 case "/setgrouplink": if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_GROUP_INVITE_URL, args.trim()); sendText(chatId, "✅ Инвайт-ссылка сохранена."); break;
                 case "/grantsub": {
@@ -359,7 +334,6 @@ public class SoulWayBot extends TelegramLongPollingBot {
     private boolean isAdmin(long uid) { return uid == ADMIN_ID; }
     private void deny(long chatId) { sendText(chatId, "Доступ только администратору."); }
 
-    // ===== Callbacks =====
     private void handleCallback(CallbackQuery cb) {
         if (cb == null) return;
         String data = cb.getData();
@@ -377,7 +351,6 @@ public class SoulWayBot extends TelegramLongPollingBot {
                 sendWelcomeWithMenu(chatId, firstName);
                 return;
             }
-
             if (data != null && data.startsWith(CB_OPENKW_PREFIX)) {
                 String key = data.substring(CB_OPENKW_PREFIX.length());
                 Keyword kw = db.findKeywordByKey(key);
@@ -392,7 +365,7 @@ public class SoulWayBot extends TelegramLongPollingBot {
             switch (data) {
                 case CB_MENU_CLUB: {
                     String club = db.getSetting(S_CLUB_TEXT, "Информация о клубе скоро будет обновлена.");
-                    sendMenuSection(chatId, club, true);
+                    sendMenuSection(chatId, club, buildClubMenu());
                     answerCallback(cb.getId(), "");
                     break;
                 }
@@ -439,15 +412,29 @@ public class SoulWayBot extends TelegramLongPollingBot {
                     answerCallback(cb.getId(), "");
                     break;
                 }
-                default:
-                    answerCallback(cb.getId(), "Неизвестное действие.");
+                default: answerCallback(cb.getId(), "Неизвестное действие.");
             }
         } catch (Exception e) {
             LOG.error("handleCallback error", e);
         }
     }
 
-    // ===== Витрины и меню =====
+    // В SoulWayBot.java
+
+    /** Секция с заголовком и внешней ссылкой (плюс кнопка "Назад", если нужно). */
+    private void sendLinkSection(long chatId, String header, String url, boolean withBack) {
+        String body = (header == null ? "" : header) + ((url == null || url.isBlank()) ? "" : "\n" + url);
+        SendMessage sm = new SendMessage(String.valueOf(chatId), body);
+
+        if (withBack) {
+            InlineKeyboardMarkup kb = new InlineKeyboardMarkup();
+            kb.setKeyboard(List.of(List.of(btn("⬅️ Вернуться в начальное меню", CB_MENU_BACK))));
+            sm.setReplyMarkup(kb);
+        }
+        safeExec(sm);
+    }
+
+    // ===== Витрины/меню =====
 
     private InlineKeyboardMarkup buildStartGiftKeyboard() {
         String key = db.getSetting(S_GIFT_KEYWORD, "СВОБОДА").trim().toUpperCase(Locale.ROOT);
@@ -510,8 +497,10 @@ public class SoulWayBot extends TelegramLongPollingBot {
 
     private InlineKeyboardMarkup buildClubMenu() {
         InlineKeyboardMarkup kb = new InlineKeyboardMarkup();
-        kb.setKeyboard(List.of(List.of(btn("💳 ТАРИФЫ", CB_MENU_TARIFF)),
-                List.of(btn("⬅️ Вернуться в начальное меню", CB_MENU_BACK))));
+        kb.setKeyboard(List.of(
+                List.of(btn("💳 ТАРИФЫ", CB_MENU_TARIFF)),
+                List.of(btn("⬅️ Вернуться в начальное меню", CB_MENU_BACK))
+        ));
         return kb;
     }
 
@@ -532,20 +521,16 @@ public class SoulWayBot extends TelegramLongPollingBot {
         safeExec(sm);
     }
 
-    private void sendLinkSection(long chatId, String header, String url, boolean withBack) {
-        String body = header + (url == null || url.isBlank() ? "" : "\n" + url);
-        SendMessage sm = new SendMessage(String.valueOf(chatId), body);
-        if (withBack) {
-            InlineKeyboardMarkup kb = new InlineKeyboardMarkup();
-            kb.setKeyboard(List.of(List.of(btn("⬅️ Вернуться в начальное меню", CB_MENU_BACK))));
-            sm.setReplyMarkup(kb);
-        }
+    /** Перегрузка — секция с произвольной клавиатурой. */
+    private void sendMenuSection(long chatId, String text, InlineKeyboardMarkup kb) {
+        SendMessage sm = new SendMessage(String.valueOf(chatId), text);
+        sm.setReplyMarkup(kb);
         safeExec(sm);
     }
 
-    // ===== ТАРИФЫ: строим ссылку строго "как в документации" на поддомене =====
+    // ===== Ссылки на оплату «как в документации» =====
 
-    /** Кодируем ТОЛЬКО ЗНАЧЕНИЯ; ключи (включая products[0][name]) оставляем как есть. */
+    /** Кодируем ТОЛЬКО значения; ключи (products[0][name]) оставляем как есть. */
     private static String appendParamsRawKeys(String base, Map<String, String> params) {
         StringBuilder sb = new StringBuilder(base);
         boolean hasQ = base.contains("?");
@@ -556,25 +541,23 @@ public class SoulWayBot extends TelegramLongPollingBot {
         return sb.toString();
     }
 
-    /** Полная ссылка оплаты с do=pay, order_num, customer_extra, products[0]... и дублирующим sum. */
+    /** Полная ссылка оплаты: do=pay, order_id, customer_extra, products[0]... */
     private String buildProdamusLink(String baseUrl, long uid, int days, int priceRub, String productName) {
-        // Нормализуем базу (должна быть поддоменная форма, а не шортссылка)
         String base = baseUrl == null || baseUrl.isBlank() ? "https://soulway.payform.ru/" : baseUrl.trim();
         if (!base.endsWith("/")) base = base + "/";
 
-        String orderNum = buildOrderNumToken(uid, days); // swb:<uid>:<days>:<h>
+        String orderId = buildOrderIdToken(uid, days); // swb:<uid>:<days>:<h>
 
         Map<String, String> p = new LinkedHashMap<>();
         p.put("do", "pay");
-        p.put("order_num", orderNum);
-        p.put("customer_extra", String.valueOf(uid));
-        // Prodamus часто передаёт и общий sum, и products[0][price] — дублируем для надёжности
-        p.put("sum", String.valueOf(priceRub));
+        p.put("order_id", orderId);                     // <- ТВОЙ номер заказа (вернётся в вебхуке)
+        p.put("customer_extra", String.valueOf(uid));   // <- «Дополнительные данные» (для нас — tg uid)
         p.put("products[0][price]", String.valueOf(priceRub));
         p.put("products[0][quantity]", "1");
         p.put("products[0][name]", productName);
 
-        return appendParamsRawKeys(base, p);
+        String link = appendParamsRawKeys(base, p);
+        return link;
     }
 
     private static int extractPriceRub(String labelOrPrice, int def) {
@@ -584,7 +567,6 @@ public class SoulWayBot extends TelegramLongPollingBot {
     }
 
     private void sendTariffs(long chatId, long userId, boolean withBack) {
-        // Берём БАЗОВЫЙ URL формы из каждой настройки (но он ДОЛЖЕН быть поддоменом, а не payform.ru/xxxx/)
         String u1 = db.getSetting(S_TAR1_URL, "https://soulway.payform.ru/");
         String u2 = db.getSetting(S_TAR2_URL, "https://soulway.payform.ru/");
         String u3 = db.getSetting(S_TAR3_URL, "https://soulway.payform.ru/");
@@ -609,7 +591,6 @@ public class SoulWayBot extends TelegramLongPollingBot {
         String link2 = buildProdamusLink(u2, userId, d2, p2, name2);
         String link3 = buildProdamusLink(u3, userId, d3, p3, name3);
 
-        // Логируем — ПОЛНЫЕ ссылки, чтобы видеть параметры глазами
         LOG.info("[tariffs] uid={} link1={}", userId, link1);
         LOG.info("[tariffs] uid={} link2={}", userId, link2);
         LOG.info("[tariffs] uid={} link3={}", userId, link3);
@@ -647,7 +628,6 @@ public class SoulWayBot extends TelegramLongPollingBot {
         safeExec(sm);
     }
 
-    // ===== Успешная оплата → выдача подписки и инвайта =====
     public void onProdamusPaid(long uid, int days) {
         try {
             if (uid <= 0) { LOG.warn("onProdamusPaid: пустой uid"); return; }
@@ -661,7 +641,6 @@ public class SoulWayBot extends TelegramLongPollingBot {
         } catch (Exception e) { LOG.error("onProdamusPaid error", e); }
     }
 
-    // ===== Группа =====
     private String ensureInviteLink() {
         String invite = db.getSetting(S_GROUP_INVITE_URL, "");
         if (!invite.isBlank()) return invite;
@@ -679,7 +658,6 @@ public class SoulWayBot extends TelegramLongPollingBot {
         return null;
     }
 
-    /** Кикаем всех с истёкшей подпиской (бот должен быть админом). */
     private int cleanupExpired() {
         String groupIdStr = db.getSetting(S_GROUP_ID, "");
         if (groupIdStr.isBlank()) return 0;
@@ -697,7 +675,6 @@ public class SoulWayBot extends TelegramLongPollingBot {
         return removed;
     }
 
-    // ===== Награда (файлы/фото) =====
     private void sendReward(long chatId, Keyword kw) {
         try {
             List<String> materials = kw.getMaterials();
@@ -750,7 +727,7 @@ public class SoulWayBot extends TelegramLongPollingBot {
         }
     }
 
-    // ===== helpers =====
+    // ==== helpers ====
     private void safeExec(BotApiMethod<?> method) {
         try { execute(method); } catch (Exception e) { LOG.error("execute error", e); }
     }
@@ -794,7 +771,7 @@ public class SoulWayBot extends TelegramLongPollingBot {
         }
 
         if (v.startsWith("http://") || v.startsWith("https://")) return new InputFile(normalizeUrl(v));
-        return new InputFile(v); // Telegram file_id
+        return new InputFile(v);
     }
 
     private static String normalizeUrl(String url) {
