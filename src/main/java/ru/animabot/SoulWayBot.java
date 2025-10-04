@@ -25,14 +25,15 @@ import java.util.concurrent.*;
 /**
  * SoulWayBot + Prodamus:
  *  - «О клубе» → текст + кнопки «Тарифы», «Назад».
- *  - «Тарифы» → три кнопки-ссылки Prodamus с order_id и days.
+ *  - «Тарифы» → три кнопки-ссылки Prodamus с customer_extra и days.
  *  - Webhook Prodamus: активация подписки и приглашение в группу.
  *  - Периодическая чистка истекших подписок.
  *
- * ВАЖНО по файловой системе:
- *  - В контейнер смонтирована директория /work/files (docker -v /srv/soulway2/files:/work/files).
- *  - В материалах можно указывать относительный путь вида "files/имя.pdf" — он будет превращён в "/work/files/имя.pdf".
- *  - Локальные файлы отправляются как File (а не как URL), что устраняет проблемы с кириллицей/пробелами.
+ * Файлы материалов:
+ *  - На хосте: /root/soulway6/files/...
+ *  - В контейнере смонтировано как: /work/files/...
+ *  - В ключевых словах указывай пути как "files/имя.pdf".
+ *  - Добавлен fallback: если указано просто "имя.pdf", бот попробует /work/files/имя.pdf.
  */
 public class SoulWayBot extends TelegramLongPollingBot {
 
@@ -97,8 +98,7 @@ public class SoulWayBot extends TelegramLongPollingBot {
                 "👋 Привет! Это @"+BOT_USERNAME+" \n\n" +
                         "✨ Введите кодовое слово и получите подарок.\n\n" +
                         "Я — Анна Сибирская, энерготерапевт и основатель клуба «Путь души | Soul Way». " +
-                        "Здесь — практики, медитации, поддержка и живое сообщество.\n\n" +
-                        "Чтобы начать, просто пришлите кодовое слово одним сообщением. Если его нет — нажмите «О клубе» после получения подарка ❤️");
+                        "Чтобы начать, просто пришлите кодовое слово одним сообщением. Если его нет — после подарка появится меню ❤️");
 
         putIfEmpty(S_CLUB_TEXT,
                 "📘 О КЛУБЕ\n\n" +
@@ -249,7 +249,7 @@ public class SoulWayBot extends TelegramLongPollingBot {
                 case "/setreviews_text":  if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_REVIEWS_TEXT, args);  sendText(chatId, "✅ Текст «Отзывы» обновлён."); break;
                 case "/setabout":         if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_ABOUT_TEXT, args);    sendText(chatId, "✅ Текст «Обо мне» обновлён."); break;
                 case "/setsessions":      if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_SESSIONS_URL, args);  sendText(chatId, "✅ Ссылка «Мои сеансы» обновлена."); break;
-                case "/setsessions_text": if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_SESSIONS_TEXT, args); sendText(chatId, "✅ Текст «Мои сеансsы» обновлён."); break;
+                case "/setsessions_text": if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_SESSIONS_TEXT, args); sendText(chatId, "✅ Текст «Мои сеансы» обновлён."); break;
                 case "/setprocveta":      if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_PROCVETA_URL, args);  sendText(chatId, "✅ Ссылка «Клуб Процветай» обновлена."); break;
                 case "/setprocveta_text": if (!isAdmin(userId)) { deny(chatId); break; } db.setSetting(S_PROCVETA_TEXT, args); sendText(chatId, "✅ Текст «Клуб Процветай» обновлён."); break;
 
@@ -345,7 +345,7 @@ public class SoulWayBot extends TelegramLongPollingBot {
                 answerCallback(cb.getId(), "✅ Подписка подтверждена!");
                 // Выдача материалов
                 sendReward(chatId, kw);
-                // Один раз — показать меню
+                // Показать меню один раз — после выдачи бонуса
                 String firstName = cb.getFrom().getFirstName() != null ? cb.getFrom().getFirstName() : "друг";
                 sendWelcomeWithMenu(chatId, firstName);
                 return;
@@ -441,7 +441,7 @@ public class SoulWayBot extends TelegramLongPollingBot {
             try {
                 SendVideo sv = new SendVideo();
                 sv.setChatId(String.valueOf(chatId));
-                InputFile videoFile = toInputFile(videoRef, true); // true — пытаемся трактовать как локальный/URL
+                InputFile videoFile = toInputFile(videoRef, true); // локальный/URL/file_id
                 sv.setVideo(videoFile);
                 sv.setCaption(text);
                 sv.setReplyMarkup(menu);
@@ -517,10 +517,19 @@ public class SoulWayBot extends TelegramLongPollingBot {
         int d3 = safeParseInt(db.getSetting(S_TAR3_DAYS, "365"), 365);
         String u3 = db.getSetting(S_TAR3_URL,  "https://payform.ru/kr9it4z/");
 
-        // к ссылкам добавляем order_id и days — Prodamus пришлёт их в webhook
-        String link1 = appendParams(u1, Map.of("order_id", String.valueOf(userId), "days", String.valueOf(d1)));
-        String link2 = appendParams(u2, Map.of("order_id", String.valueOf(userId), "days", String.valueOf(d2)));
-        String link3 = appendParams(u3, Map.of("order_id", String.valueOf(userId), "days", String.valueOf(d3)));
+        // ПРОДАЁМ ЧЕРЕЗ customer_extra (а не order_id), + days
+        String link1 = appendParams(u1, Map.of(
+                "customer_extra", String.valueOf(userId),
+                "days", String.valueOf(d1)
+        ));
+        String link2 = appendParams(u2, Map.of(
+                "customer_extra", String.valueOf(userId),
+                "days", String.valueOf(d2)
+        ));
+        String link3 = appendParams(u3, Map.of(
+                "customer_extra", String.valueOf(userId),
+                "days", String.valueOf(d3)
+        ));
 
         InlineKeyboardButton b1 = new InlineKeyboardButton(l1 + " • оплатить");
         b1.setUrl(link1);
@@ -636,7 +645,6 @@ public class SoulWayBot extends TelegramLongPollingBot {
             List<String> materials = kw.getMaterials();
             String rewardText = safeTrim(kw.getRewardText());
 
-            // Если материалов нет — просто текст (если есть), а затем меню (вызов NOT here! Меню будет после sendReward из колбэка)
             if (materials == null || materials.isEmpty()) {
                 if (!rewardText.isEmpty()) sendText(chatId, rewardText);
                 return;
@@ -651,20 +659,17 @@ public class SoulWayBot extends TelegramLongPollingBot {
                 else docs.add(v);
             }
 
-            // Если есть обложка-изображение и нет других файлов
             if (image != null && docs.isEmpty()) {
                 sendSinglePhoto(chatId, image, rewardText);
                 return;
             }
 
-            // Если есть обложка + документы — сначала фото (с подписью), затем документы по одному
             if (image != null) {
                 sendSinglePhoto(chatId, image, rewardText);
                 if (!docs.isEmpty()) sendDocumentsIndividually(chatId, docs);
                 return;
             }
 
-            // Только документы → если есть текст, отправим его сперва
             if (!rewardText.isEmpty()) sendText(chatId, rewardText);
             sendDocumentsIndividually(chatId, docs);
 
@@ -716,7 +721,7 @@ public class SoulWayBot extends TelegramLongPollingBot {
         return b;
     }
 
-    /** Единый метод отправки текста (исправляет «ambiguous method call»). */
+    /** Единый метод отправки текста. */
     private void sendText(long id, String text) {
         try { execute(new SendMessage(String.valueOf(id), text)); }
         catch (Exception e) { LOG.error("sendText error", e); }
@@ -737,6 +742,7 @@ public class SoulWayBot extends TelegramLongPollingBot {
      * Правила:
      *  - Если начинается с "files/" или "/files/" → маппим в локальный путь под /work/files/...
      *  - Если абсолютный локальный путь (существует как файл) → шлём как File
+     *  - FALLBACK: если указано просто имя без слэшей → пробуем /work/files/<имя>
      *  - Если http(s) → шлём как URL
      *  - Иначе — считаем, что это Telegram file_id
      */
@@ -744,25 +750,33 @@ public class SoulWayBot extends TelegramLongPollingBot {
         String v = safeTrim(ref);
         if (v.isEmpty()) return new InputFile(v);
 
-        // files/... → /work/files/...
+        // 1) files/... → /work/files/...
         if (v.startsWith("files/") || v.startsWith("/files/")) {
             String tail = v.startsWith("/files/") ? v.substring("/files/".length()) : v.substring("files/".length());
             File local = new File(FILES_ROOT + tail);
             return new InputFile(local, local.getName());
         }
 
-        // Явный локальный путь?
+        // 2) Явный локальный путь?
         File f = new File(v);
         if (tryLocalFirst && f.exists() && f.isFile()) {
             return new InputFile(f, f.getName());
         }
 
-        // URL?
+        // 3) FALLBACK: basename → /work/files/<basename>
+        if (!v.startsWith("http://") && !v.startsWith("https://") && !v.contains("/")) {
+            File local = new File(FILES_ROOT + v);
+            if (local.exists() && local.isFile()) {
+                return new InputFile(local, local.getName());
+            }
+        }
+
+        // 4) URL?
         if (v.startsWith("http://") || v.startsWith("https://")) {
             return new InputFile(normalizeUrl(v));
         }
 
-        // Telegram file_id
+        // 5) Telegram file_id
         return new InputFile(v);
     }
 
